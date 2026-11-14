@@ -113,6 +113,14 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
+        const assignmentId = current.assignments.at(-1)?.id
+        const rejectReady = (message: string): never => {
+          const latest = host.store.tickets.get(ticketId)
+          if (latest && liveTicket(latest) && latest.assignments.at(-1)?.id === assignmentId) {
+            host.engine.report(ticketId, { state: 'progress', summary: message, readyRejected: true })
+          }
+          throw new Error(message)
+        }
         if (args.state === 'ready') {
           const numbers = pullNumbers(current)
           if (pull?.state === 'open') numbers.add(pull.number)
@@ -121,25 +129,28 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
             if (before.state !== 'open') continue
             const claimed = args.verified_heads?.[String(number)] ?? (numbers.size === 1 ? args.verified_head_sha : undefined)
             if (claimed !== before.head.sha) {
-              throw new Error(`PR #${number} head is ${before.head.sha}. Push your intended changes, verify that revision and its checks, and report its exact SHA in verified_head_sha or verified_heads.`)
+              rejectReady(`PR #${number} head is ${before.head.sha}. Push your intended changes, verify that revision and its checks, and report its exact SHA in verified_head_sha or verified_heads.`)
             }
             const checklist = await readReviewThreads(host.github, number, signal)
             const threads = checklist.filter(thread => !thread.resolved)
             if (threads.length) {
-              throw new Error(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, resolve addressed threads with resolveReviewThread, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
+              rejectReady(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, resolve addressed threads with resolveReviewThread, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
             }
             const missing = checklist.filter(thread => !args.review_evidence?.[thread.id])
             if (missing.length) {
-              throw new Error(`PR #${number} needs review evidence for ${missing.map(thread => thread.id).join(', ')}. Use orchestrator_review_checklist and verify the requested code and tests for each thread.`)
+              rejectReady(`PR #${number} needs review evidence for ${missing.map(thread => thread.id).join(', ')}. Use orchestrator_review_checklist and verify the requested code and tests for each thread.`)
             }
             const after = await readPull(host.github, number, signal)
             if (after.head.sha !== before.head.sha) {
-              throw new Error(`PR #${number} changed during verification. Check the current head and review threads again before reporting ready.`)
+              rejectReady(`PR #${number} changed during verification. Check the current head and review threads again before reporting ready.`)
             }
           }
         }
         // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
         return host.store.atomic(() => {
+          if (host.store.tickets.get(ticketId)?.assignments.at(-1)?.id !== assignmentId) {
+            throw new Error('Assignment changed during report verification')
+          }
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
           const evidence = args.state === 'ready' && Object.entries(args.review_evidence ?? {})

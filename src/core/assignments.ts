@@ -11,6 +11,7 @@ import { automatic, type Tickets } from './tickets.ts'
 export interface WorkerReport {
   state: ReportState
   summary: string
+  readyRejected?: boolean
   /** Open question for a person: a string asks it, `null` clears an open one, and `undefined` keeps the current one. */
   question?: string | null
   /** The person's message whose request raised the question; routes the question to the channel where it was written. */
@@ -125,14 +126,17 @@ export class Assignments extends EnginePart {
         && ['conversation', 'inline', 'review'].includes(String(trigger.meta.kind))
     }
     const openPull = ticket.follows?.some(follow => follow.thread.startsWith('github:') && !follow.closed)
-    const retryReview = report.state === 'dropped' && !attention && openPull
+    if (report.readyRejected) assignment.readyRejection = report.summary
+    if (['ready', 'blocked', 'failed'].includes(report.state) || attention) delete assignment.readyRejection
+    const rejected = report.state === 'waiting' && !attention ? assignment.readyRejection : undefined
+    const retryReview = rejected !== undefined || report.state === 'dropped' && !attention && openPull
       && (review(ticket.origin.triggerId) || ticket.inputs.some(input => input.kind === 'trigger'
         && input.deliveredTo === assignment.id && review(input.triggerId))
         || ticket.assignments.at(-2)?.endedReason === 'reviewRetry')
     const previousRetries = ticket.assignments.slice(0, -1).reverse().findIndex(item => item.endedReason !== 'reviewRetry')
     const retries = previousRetries < 0 ? ticket.assignments.length - 1 : previousRetries
     const state = retryReview ? retries < 2 ? 'progress' : 'failed' : report.state
-    assignment.report = { state, summary: report.summary, at }
+    assignment.report = { state, summary: rejected ?? report.summary, at }
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
     if (report.answers) this.takeUp(ticketId, report.answers)
@@ -141,7 +145,7 @@ export class Assignments extends EnginePart {
     if (retryReview && state === 'progress') {
       this.options.executor.stop(ticket, assignment, 'reviewRetry')
       this.tickets.restart(ticket, assignment, 'reviewRetry',
-        `Continue the open PR review. Previous report: ${report.summary.slice(0, 1500)}. Inspect the current worktree and remote PR, finish remaining fixes, test, push and verify the remote head, then resolve the addressed review threads and verify their status. Report blocked with a concrete human action if you cannot proceed.`)
+        `Continue the open PR review. Previous report: ${(rejected ?? report.summary).slice(0, 1500)}. Inspect the current worktree and remote PR, finish remaining fixes, test, push and verify the remote head, then resolve the addressed review threads and verify their status. Report blocked with a concrete human action if you cannot proceed.`)
       return this.require(ticketId)
     }
     // A ticket that follows Threads ends with them: a ready report ends it only once followsDone holds, with that outcome.
