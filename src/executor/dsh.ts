@@ -56,6 +56,9 @@ export function transient(error: unknown): boolean {
   const text = error instanceof Error ? `${error.name} ${error.message} ${String((error as { code?: unknown }).code ?? '')}` : String(error)
   return PASSING.test(text)
 }
+type ModelRoute = Pick<RoleModel, 'provider' | 'model'>
+const modelKey = (route: ModelRoute): string => JSON.stringify([route.provider, route.model])
+type ModelFailover = { attempts: number; tried: Set<string>; candidates?: RoleModel[] }
 /** Appends a stable 12-character ticket ID suffix to a validated English worktree name. */
 const ticketWorktreeName = (name: string, id: string): string => `${WorktreeNameSchema.parse(name)}-${id.slice(0, 12)}`
 /** Host dependencies used by `DshExecutor`. */
@@ -212,6 +215,7 @@ export class DshExecutor implements Executor {
   private readonly slots: WorkerSlots
   /** Transient failure counts tried so far: keyed by `assignment.id` for worker turns and `launch:<assignment.id>` for launches. */
   private readonly transient = new Map<string, number>()
+  private readonly failover = new Map<string, ModelFailover>()
   /** Assignment IDs currently waiting on a transient-failure backoff timer before resuming their worker turn. */
   private readonly resuming = new Set<string>()
   /**
@@ -358,6 +362,7 @@ export class DshExecutor implements Executor {
    * report with no Input delivered since, and stops its shell jobs and subagents, including jobs it left to a person.
    */
   stop(ticket: Ticket, assignment: Assignment, reason: string): void {
+    this.failover.delete(assignment.id)
     this.transient.delete(assignment.id); this.transient.delete(`launch:${assignment.id}`)
     const report = assignment.report
     const busy = !!assignment.deliveredAt && !!report && assignment.deliveredAt >= report.at
@@ -509,12 +514,15 @@ export class DshExecutor implements Executor {
       const ticket = this.ticketOf(agent)
       const assignment = ticket && runningAssignment(ticket)
       if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing()) return
-      if (this.retries(assignment.id, error)) {
-        const limited = error instanceof LlmError && (error.failure.status === 429 || error.failure.code === 'RATE_LIMIT')
-        const fallback = limited ? this.host.store.settings().executor.fallbackModel : null
-        this.resumeAfter(ticket.id, assignment.id, error, fallback ? { agent, model: fallback } : undefined)
+      const limited = error instanceof LlmError && (error.failure.status === 429 || error.failure.code === 'RATE_LIMIT')
+      if (limited) {
+        const chain = this.failover.get(assignment.id) ?? { attempts: 0, tried: new Set<string>() }
+        this.failover.set(assignment.id, chain)
+        this.resumeAfter(ticket.id, assignment.id, error, { agent, chain })
         return
       }
+      if (this.retries(assignment.id, error)) { this.resumeAfter(ticket.id, assignment.id, error); return }
+      this.failover.delete(assignment.id)
       void this.background(Promise.resolve().then(() => { this.failed(ticket.id, String(error)) }))
     }))
   }
@@ -523,6 +531,7 @@ export class DshExecutor implements Executor {
     for (const dispose of this.disposers.splice(0)) dispose()
     for (const timer of this.timers) clearTimeout(timer)
     this.timers.clear()
+    this.failover.clear()
   }
   /**
    * Reconciles running and pending assignments across open tickets after a host restart: notifies Engine of interrupted
@@ -560,8 +569,8 @@ export class DshExecutor implements Executor {
     return true
   }
   /** Schedules a worker turn retry with exponential backoff after a transient provider or network error. */
-  private resumeAfter(ticketId: string, assignmentId: string, error: unknown, fallback?: { agent: Agent; model: RoleModel }): void {
-    const tries = this.transient.get(assignmentId)!
+  private resumeAfter(ticketId: string, assignmentId: string, error: unknown, fallback?: { agent: Agent; chain: ModelFailover }): void {
+    const tries = fallback ? ++fallback.chain.attempts : this.transient.get(assignmentId)!
     const text = `Your last turn failed for a passing reason (${String(error).slice(0, 200)}). Continue the assignment where it stopped.`
     this.resuming.add(assignmentId)
     const live = () => {
@@ -581,22 +590,49 @@ export class DshExecutor implements Executor {
       }
       const sent = (async () => {
         if (fallback) {
-          const { agent, model } = fallback
-          const selected = await resolveRoleModel(this.host.context, model)
-          const current = agent.session.requestHeader()?.config
-          if (selected.provider !== current?.provider || selected.model !== current?.model) {
-            if (!live() || this.host.context.agents.get(agent.id) !== agent) return
-            await selectRoleModel(this.host.context, agent, selected)
-          }
+          const { agent, chain } = fallback
+          const selected = await this.nextFallback(agent, chain)
+          if (!live() || this.host.context.agents.get(agent.id) !== agent) return
+          if (!selected) throw new Error(`All available worker models exhausted after rate limiting: ${String(error)}`)
+          await selectRoleModel(this.host.context, agent, selected)
         }
         if (live()) {
-          await this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue')
+          const attempt = fallback ? `model:${tries}` : tries
+          await this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${attempt}`, text, 'queue')
         }
       })()
       void this.background(sent.finally(() => { if (waking) this.slots.free(ticketId); this.resuming.delete(assignmentId) })
-        .catch(failure => { if (live()) this.failed(ticketId, String(failure)) }))
+        .catch(failure => {
+          this.failover.delete(assignmentId)
+          if (live()) this.failed(ticketId, String(failure))
+        }))
     }
-    this.after(TRANSIENT_BACKOFF_MS * 2 ** (tries - 1), go)
+    this.after(fallback ? TRANSIENT_BACKOFF_MS : TRANSIENT_BACKOFF_MS * 2 ** (tries - 1), go)
+  }
+  private async nextFallback(agent: Agent, chain: ModelFailover) {
+    const ctx = this.host.context
+    if (!chain.candidates) {
+      const catalog = await ctx.sessionController.modelCatalog()
+      const { model, fallbackModel } = this.host.store.settings().executor
+      const current = agent.session.requestHeader()?.config ?? model ?? catalog.default
+      if (current) chain.tried.add(modelKey(current))
+      chain.candidates = [
+        ...(fallbackModel ? [fallbackModel] : []),
+        ...catalog.groups.flatMap(group => group.models.map(item => ({ provider: group.id, model: item.id }))),
+      ]
+    }
+    for (const candidate of chain.candidates) {
+      const key = modelKey(candidate)
+      if (chain.tried.has(key)) continue
+      chain.tried.add(key)
+      let selected
+      try { selected = await resolveRoleModel(ctx, candidate) }
+      catch { continue } // Discovery may include a route that is no longer usable.
+      const resolved = modelKey(selected)
+      if (resolved !== key && chain.tried.has(resolved)) continue
+      chain.tried.add(resolved)
+      return selected
+    }
   }
   /** Schedules `then` to run after `ms` milliseconds unless `dispose()` is called first. */
   private after(ms: number, then: () => void): void {
@@ -628,6 +664,7 @@ export class DshExecutor implements Executor {
     if (this.resuming.has(idle.id) || agent.status !== 'idle') return
     // A turn that ended as turns do starts the count of passing failures again.
     this.transient.delete(idle.id)
+    this.failover.delete(idle.id)
     // The ticket while the Assignment that went idle runs it.
     const live = () => {
       const stored = this.host.store.tickets.get(ticket.id)

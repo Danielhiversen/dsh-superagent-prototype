@@ -1554,20 +1554,36 @@ it('relays the status-request hint when a worker\'s turn ends with no text and n
     summary: expect.stringContaining('orchestrator_ticket_request_status') })
 })
 
-it('resumes the same worker on its configured backup when the model returns HTTP 429', async () => {
-  const fallback = { provider: 'backup', model: 'backup-model' }
+it('tries every catalog route once after HTTP 429, with the configured backup first', async () => {
+  const primary = { provider: 'primary', model: 'main' }
+  const fallback = { provider: 'backup', model: 'preferred' }
+  const alternatives = ['a', 'b', 'c', 'd'].map(model => ({ provider: 'backup', model }))
   const settings = runtime.store.settings()
-  runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fallbackModel: fallback } })
+  runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, model: primary, fallbackModel: fallback } })
+  Object.assign(controller, { modelCatalog: vi.fn(async () => ({
+    default: primary,
+    groups: [
+      { id: primary.provider, models: [{ id: primary.model }] },
+      { id: fallback.provider, models: [{ id: fallback.model }, ...alternatives.map(route => ({ id: route.model }))] },
+    ],
+  })) })
   const { ticket, sessionId } = await acceptedTicket()
-  const agent = agents.get(sessionId)!
+  const agent = agents.get(sessionId)! as unknown as import('@deepseek-ai/dsh-agent').Agent
+  const selected = () => agent.session.snapshotEvents().filter(event => event.type === 'model/selection').map(event => event.data)
+  const ctx = (runtime as unknown as { ctx: Context }).ctx
+  const fail = (turn: number) => ctx.emit('agent/error', { agent, turn, step: 1, error: new LlmError('Too Many Requests', 'RATE_LIMIT', { status: 429 }) })
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
   try {
-    const ctx = (runtime as unknown as { ctx: Context }).ctx
-    ctx.emit('agent/error', { agent, turn: 1, step: 1, error: new LlmError('Too Many Requests', 'RATE_LIMIT', { status: 429 }) } as never)
+    for (const [index, route] of [fallback, ...alternatives].entries()) {
+      fail(index + 1)
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(selected().at(-1)).toEqual(route)
+    }
+    fail(6)
     await vi.advanceTimersByTimeAsync(15_000)
-    expect((agent as unknown as import('@deepseek-ai/dsh-agent').Agent).session.snapshotEvents()).toContainEqual({ type: 'model/selection', data: fallback })
-    expect(deliveries.mock.calls.filter(([call]) => call.sessionId === sessionId)).toHaveLength(2)
-    expect(runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.report).toBeUndefined()
+    expect(selected()).toEqual([primary, fallback, ...alternatives])
+    expect(deliveries.mock.calls.filter(([call]) => call.sessionId === sessionId)).toHaveLength(6)
+    expect(runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('Too Many Requests') })
   } finally { vi.useRealTimers() }
 })
 

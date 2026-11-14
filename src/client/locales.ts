@@ -337,7 +337,7 @@ const TEXT = {
   executorIntro: ['执行器执行派工：每个工单一个执行器 Session 和执行目录。', 'The Executor runs Assignments: one Executor Session and directory per Ticket.'],
   executorModel: ['执行器模型', 'Executor model'],
   executorFallbackModel: ['备用模型', 'Fallback model'],
-  executorFallbackModelHint: ['执行器模型被限流时，使用此模型继续同一个会话。', 'When the worker model is rate-limited, continue the same session on this model.'],
+  executorFallbackModelHint: ['执行器模型被限流时，先尝试此模型，再尝试目录中的其他模型。', 'When the worker model is rate-limited, try this model first, then try the other models in the catalog.'],
   executorModelHint: ['保存后用于新建的执行器 Session，已有 Session 保持原选择。留空继承 DSH 默认值。', 'Applies to new Executor Sessions; existing Sessions keep their choice. Leave empty to inherit the DSH default.'],
   assignmentReportShort: ['报告：{state}', 'Report: {state}'],
   assignmentSpan: ['{from} → {to}', '{from} → {to}'],
