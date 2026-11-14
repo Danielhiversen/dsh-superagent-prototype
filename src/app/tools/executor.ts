@@ -80,6 +80,10 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
         pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
+        verified_head_sha: z.string().regex(/^[0-9a-f]{40}$/).optional()
+          .describe('For ready with one open PR, the full SHA of the pushed commit you verified.'),
+        verified_heads: z.record(z.string().regex(/^[1-9][0-9]*$/), z.string().regex(/^[0-9a-f]{40}$/)).optional()
+          .describe('For ready with multiple open PRs, verified full commit SHAs keyed by PR number.'),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
       }).strict(),
       execute: async (args, signal) => {
@@ -91,9 +95,19 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
             !follow.closed && /^github:[0-9]+$/.test(follow.thread) ? [Number(follow.thread.slice(7))] : []))
           if (pull?.state === 'open') numbers.add(pull.number)
           for (const number of numbers) {
+            const before = pull?.number === number ? pull : await readPull(host.github, number, signal)
+            if (before.state !== 'open') continue
+            const claimed = args.verified_heads?.[String(number)] ?? (numbers.size === 1 ? args.verified_head_sha : undefined)
+            if (claimed !== before.head.sha) {
+              throw new Error(`PR #${number} head is ${before.head.sha}. Push your intended changes, verify that revision and its checks, and report its exact SHA in verified_head_sha or verified_heads.`)
+            }
             const threads = await openReviewThreads(host.github, number, signal)
             if (threads.length) {
               throw new Error(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, resolve addressed threads with resolveReviewThread, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
+            }
+            const after = await readPull(host.github, number, signal)
+            if (after.head.sha !== before.head.sha) {
+              throw new Error(`PR #${number} changed during verification. Check the current head and review threads again before reporting ready.`)
             }
           }
         }
