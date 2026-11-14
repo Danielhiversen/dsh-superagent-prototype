@@ -195,6 +195,9 @@ export function settingsPolicy(settings: Settings, sources: SourceScope): Policy
       const row = scope.listened ? scope.row : undefined
       const recorded = { source: trigger.source, scope: trigger.meta, ...row === undefined ? {} : { row }, ...allowed ? { sender: senderName(allowed) } : {} }
       if (allowed && trigger.addressed) return { admissible: true, strength: 'explicit', basis: { ...recorded, via: 'addressed', addressed: trigger.addressed } }
+      if (allowed && scope.listened && scope.trustedReview) {
+        return { admissible: true, strength: 'explicit', basis: { ...recorded, via: 'trustedReview' } }
+      }
       const cell = admissionCell(!!allowed, !!trigger.addressed)!
       // Unaddressed messages only use the admission table when the Source observes all messages in that scope.
       const receivable = !!trigger.addressed || (scope.listened && scope.observed)
@@ -216,6 +219,7 @@ export function settingsPolicy(settings: Settings, sources: SourceScope): Policy
       const { source } = basis
       const current = source && basis.scope ? listened(sources, source, basis.scope) : undefined
       if (current && !current.listened) return false
+      if (basis.via === 'trustedReview') return !!(current?.listened && current.trustedReview && allowedSender(settings, mandate.actor))
       const rulesOn = (rules: string[] | undefined) => (rules ?? []).every(id => settings.policy.rules.some(rule => rule.enabled && rule.id === id))
       // Explicit follow-ups remain valid; inferred follow-ups require auto mode and enabled matched rules.
       if (basis.via === 'followup') return mandate.strength === 'explicit' || (mode === 'auto' && rulesOn(basis.rules))

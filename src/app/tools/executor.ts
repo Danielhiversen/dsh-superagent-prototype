@@ -94,10 +94,13 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           const updated = host.engine.report(ticketId, report)
-          const relay = reportRelay(updated, report)
+          const recorded = updated.assignments.at(-1)?.report
+          const retrying = args.state === 'dropped' && !updated.ended && updated.assignments.at(-2)?.endedReason === 'reviewRetry'
+            && !recorded
+          const relay = retrying ? undefined : reportRelay(updated, recorded ? { ...report, state: recorded.state } : report)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'
-          return { reported: true, notification, ...(updated.attention ? { attention: updated.attention } : {}) }
+          return { reported: true, notification, ...retrying ? { retrying: true } : {}, ...(updated.attention ? { attention: updated.attention } : {}) }
         })
       },
     }),

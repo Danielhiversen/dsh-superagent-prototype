@@ -9,7 +9,7 @@ import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddres
   from './github-trigger.ts'
 import { githubLink, sendGithub } from './github-channel.ts'
 import type { GithubComment, PullRef } from './github-trigger.ts'
-import { observePull, pullsOf, readPull, type Pull } from './github-pull.ts'
+import { agentPull, observePull, pullsOf, readPull, type Pull } from './github-pull.ts'
 import { health, sourceContext, type Health, type SourceContext } from './host.ts'
 import { KV } from '../kv.ts'
 import { cursorAt, pause, POLL_HORIZON_MS, pollThreads as pollEach } from './poll.ts'
@@ -19,12 +19,14 @@ import { z } from 'zod'
 export { commentTrigger, type GithubComment } from './github-trigger.ts'
 /** A notification of the agent account; `subject.url` is the API address of its Issue or PR. */
 const NotificationSchema = z.looseObject({
+  reason: z.string().optional(), updated_at: z.string().optional(),
   repository: z.looseObject({ full_name: z.string() }), subject: z.looseObject({ url: z.string().nullish() }),
 })
 
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
+  addressOwnPullReviews: z.boolean().default(false),
   observeCi: z.boolean().default(false) }).strict()
 export type GithubConfig = z.infer<typeof GithubConfigSchema>
 const OBSERVED = { issues: 'observeIssues', pulls: 'observePulls', comments: 'observeComments', ci: 'observeCi' } as const
@@ -53,12 +55,16 @@ export const githubKind: SourceKind<GithubConfig> = {
       hint: { zh: '打开后，没有 @ 智能体的新 PR 也会收到，由策略的接收表决定是否成为候选。', en: 'New pull requests that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
     { key: 'observeComments', type: 'switch', label: { zh: '接收仓库里的评论', en: 'Receive comments in the repository' },
       hint: { zh: '打开后，Issue 和 PR 上没有 @ 智能体的评论和代码评论也会收到，由策略的接收表决定是否成为候选。', en: 'Comments and review comments on Issues and PRs that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
+    { key: 'addressOwnPullReviews', type: 'switch', label: { zh: '处理自己 PR 的评论和评审', en: 'Address reviews and comments on agent-authored PRs' },
+      hint: { zh: '为允许的 GitHub 用户在智能体已打开的 PR 上提交的评审和评论创建候选，无需提及智能体。', en: 'Treat reviews and comments from allowed GitHub users on open PRs authored by the agent as requests, even without a mention.' } },
     { key: 'observeCi', type: 'switch', label: { zh: '接收默认分支的 CI', en: 'Receive the default branch\'s CI' },
       hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } }],
   // What the Source observes across the repository it receives in full; elsewhere, only what addresses the agent.
   scope: ({ meta }, config) => {
     const row = scopeOf(meta)
-    return { listened: true, observed: row !== undefined && config[OBSERVED[row]], ...row ? { row } : {} }
+    const trustedReview = config.addressOwnPullReviews && row === 'comments' && meta.agentPull === true
+    return { listened: true, observed: row !== undefined && config[OBSERVED[row]], ...row ? { row } : {},
+      ...trustedReview ? { trustedReview } : {} }
   },
   health: ['github'],
   channel: { send: sendGithub, link: githubLink },
@@ -152,7 +158,8 @@ interface Round {
 const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOString(), signal, pulls: new Map(), read: new Set(),
   failures: [], dropped: [], abandoned: [], tally: { skipped: 0 } })
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
-export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
+export interface Retry { since: string; pr: boolean; mentionSince?: string; failedAt?: string; attempts?: number }
+const MENTION_LOOKBACK_MS = 10 * 60_000
 const RETRY_WINDOW_MS = 24 * 3600_000
 /** True when GitHub returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
 const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
@@ -279,6 +286,7 @@ async function pollBranchCi(ctx: SourceContext, round: Round): Promise<void> {
  */
 export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promise<number> {
   const round = newRound(signal)
+  await pollOwnPullReviews(ctx, round)
   const notified = await pollNotifications(ctx, round).then(value => ({ value }), (error: unknown) => ({ error }))
   await pollRepository(ctx, round)
   await pollTicketPulls(ctx, signal, round)
@@ -293,6 +301,30 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
     + (round.tally.skipped ? `; ${round.tally.skipped} unreadable items skipped` : '')
   ctx.report('github', { state: 'ready', detail: `${count} notifications; next poll ≥ ${interval}s${dropped}`, at: round.started })
   return interval
+}
+/** Read all enabled PR conversations, including submitted reviews that have no comment body. */
+async function pollOwnPullReviews(ctx: SourceContext, round: Round): Promise<void> {
+  const config = ctx.config<GithubConfig>(SOURCE)
+  if (!config?.addressOwnPullReviews) { ctx.state.set(KV.github.ownPullSince, undefined); return }
+  const started = ctx.state.get(KV.github.ownPullSince) ?? cursorAt(round.started)
+  ctx.state.set(KV.github.ownPullSince, started)
+  const schema = z.looseObject({ number: z.number(), user: z.object({ login: z.string() }) })
+  try {
+    const pulls = await ctx.commands.withSignal(round.signal).pages(schema, 'pulls?state=open&per_page=100', round.tally)
+    for (const item of pulls) {
+      if (stopped(ctx, round)) return
+      if (!sameName(item.user.login, ctx.deployment.github.login)) continue
+      const checkpoint = KV.github.ownPullCursor(item.number)
+      const since = [started, ctx.state.get(checkpoint) ?? started].sort().at(-1)!
+      try {
+        const pr = await pull(ctx, round, item.number)
+        if (pr.state !== 'open' || !agentPull(pr, ctx.deployment)) continue
+        await intakeComments(ctx, { number: item.number, isPr: true, url: pr.html_url, prAuthor: pr.user.login },
+          since, round, since, true)
+        ctx.state.set(checkpoint, cursorAt(round.started))
+      } catch (error) { if (!stopped(ctx, round)) failed(ctx, round, item.number, error) }
+    }
+  } catch (error) { if (!stopped(ctx, round)) round.failures.push(`agent-authored pull requests: ${String(error)}`) }
 }
 /** Reads notifications since the cursor and each Issue or PR they name, advancing the cursor atomically with the retry map for failed reads; deleted (410) Issues are dropped once their error is recorded. */
 async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ count: number; interval: number }> {
@@ -320,7 +352,12 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
     const address = githubAddress(notification.subject.url ?? '', repository)
     if (!address || address.discussion || items.has(address.number)) continue
     const { number, pr } = address
-    items.set(number, { since: [state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!, pr })
+    const checkpoint = [state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!
+    // GitHub can publish the notification minutes after the comment's own update time.
+    const lookback = Date.parse(notification.updated_at ?? '') - MENTION_LOOKBACK_MS
+    const mentionSince = notification.reason === 'mention' && lookback < Date.parse(checkpoint)
+      ? new Date(lookback).toISOString() : undefined
+    items.set(number, { since: checkpoint, pr, ...mentionSince ? { mentionSince } : {} })
   }
   for (const [number, item] of items) {
     if (stopped(ctx, round)) return { count: notifications.length, interval }
@@ -354,7 +391,7 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
       const { login } = ctx.deployment.github
       const opened = Date.parse(issue.created_at) >= Date.parse(since) && !sameName(issue.user.login, login)
       if (opened) await ctx.receive(issueTrigger(issue, login))
-      await intakeComments(ctx, { number, isPr: false, url: issue.html_url }, since, round)
+      await intakeComments(ctx, { number, isPr: false, url: issue.html_url }, since, round, item.mentionSince)
       nameThread(ctx, number, issue.title)
     }
   }
@@ -366,7 +403,7 @@ async function readNotified(ctx: SourceContext, round: Round, number: number, it
       const opened = { number, title: pr.title ?? '', body: pr.body, user: pr.user, created_at: pr.created_at, html_url: pr.html_url }
       await ctx.receive(pullTrigger(opened, login))
     }
-    await intakeComments(ctx, { number, isPr: true, url: pr.html_url, prAuthor: pr.user.login }, since, round)
+    await intakeComments(ctx, { number, isPr: true, url: pr.html_url, prAuthor: pr.user.login }, since, round, item.mentionSince)
     if (pr.title) nameThread(ctx, number, pr.title)
   }
   ctx.state.set(KV.github.cursor(number), cursorAt(round.started))
@@ -381,23 +418,24 @@ function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
   }
   return read
 }
-async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, round: Round): Promise<void> {
+async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, round: Round, mentionSince = since, ownPull = false): Promise<void> {
   const commands = ctx.commands.withSignal(round.signal)
   const { login } = ctx.deployment.github
   const kinds = ref.isPr ? ['conversation', 'inline', 'review'] as const : ['conversation'] as const
   for (const kind of kinds) {
-    const suffix = `&since=${encodeURIComponent(since)}`
+    const suffix = `&since=${encodeURIComponent(mentionSince)}`
     const path = kind === 'conversation' ? `issues/${ref.number}/comments?per_page=100${suffix}` : kind === 'inline' ? `pulls/${ref.number}/comments?per_page=100${suffix}` : `pulls/${ref.number}/reviews?per_page=100`
     const comments = await commands.pages(CommentSchema, path, round.tally)
     for (const comment of comments) {
       // Stopping mid-read throws so the thread's cursor stays where it was.
       if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')
       const timestamp = Date.parse(comment.updated_at ?? comment.submitted_at ?? comment.created_at ?? '')
-      if (!Number.isFinite(timestamp) || timestamp < Date.parse(since)) continue
-      if (sameName(comment.user.login, login)) continue
+      if (!Number.isFinite(timestamp) || timestamp < Date.parse(mentionSince)) continue
+      if (sameName(comment.user.login, login) || (kind === 'review' && comment.state === 'PENDING')) continue
       // A review decision without a body still reaches the ticket: a worker may be waiting for that approval.
       const trigger = commentTrigger(comment, ref, kind, login)
-      if (trigger.text) await ctx.receive(trigger)
+      if (ownPull) trigger.meta.agentPull = true
+      if (trigger.text && (timestamp >= Date.parse(since) || trigger.addressed === 'mention')) await ctx.receive(trigger)
     }
   }
 }

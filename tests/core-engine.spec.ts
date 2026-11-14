@@ -792,6 +792,23 @@ describe('worker reports', () => {
     expect(cleared).not.toHaveProperty('attention')
     expect(h.withdrawn).toEqual([key('attention-reply', asked.attention!.id), key('attention-reply', replaced.attention!.id)])
   })
+  it('retries an open GitHub PR review when the worker reports dropped, then leaves it retryable after exhaustion', () => {
+    const h = harness()
+    h.engine.receive(trigger('1', { source: 'github', threads: [{ source: 'github', id: '12' }],
+      meta: { isPr: true, kind: 'inline' } }))
+    h.pump()
+    const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Fix', scope: 'review', reason: 'requested', acknowledgement: 'ok' }).ticketId!
+    h.engine.bindThread(ticketId, { source: 'github', id: '12' }, false)
+    h.settle()
+    for (let attempt = 0; attempt < 3; attempt++) {
+      h.engine.report(ticketId, { state: 'dropped', summary: 'Parser still needs work' })
+      h.settle()
+    }
+    const ticket = h.repo.tickets.get(ticketId)!
+    expect(ticket.ended).toBeUndefined()
+    expect(ticket.assignments).toHaveLength(3)
+    expect(ticket.assignments.at(-1)?.report?.state).toBe('failed')
+  })
   it('ends the ticket on a final report: dropped drops it, ready completes it unless it follows a Source\'s Thread that is open', () => {
     const outcome = (state: 'ready' | 'dropped' | 'failed', follows: boolean, closed = false) => {
       const h = harness()
