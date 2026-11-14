@@ -792,6 +792,19 @@ describe('worker reports', () => {
     expect(cleared).not.toHaveProperty('attention')
     expect(h.withdrawn).toEqual([key('attention-reply', asked.attention!.id), key('attention-reply', replaced.attention!.id)])
   })
+  it('retries a rejected ready report only when the same assignment goes idle', () => {
+    const h = harness()
+    const id = accepted(h).ticketId!
+    h.engine.report(id, { state: 'progress', summary: 'Missing evidence', readyRejected: true })
+    expect(h.repo.tickets.get(id)?.assignments).toHaveLength(1)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      h.engine.report(id, { state: 'waiting', summary: 'Idle' })
+      h.settle()
+      if (attempt < 2) h.engine.report(id, { state: 'progress', summary: 'Still missing', readyRejected: true })
+    }
+    expect(h.repo.tickets.get(id)?.assignments).toHaveLength(3)
+    expect(h.repo.tickets.get(id)?.assignments.at(-1)?.report?.state).toBe('failed')
+  })
   it('retries an open GitHub PR review when the worker reports dropped, then leaves it retryable after exhaustion', () => {
     const h = harness()
     h.engine.receive(trigger('1', { source: 'github', threads: [{ source: 'github', id: '12' }],

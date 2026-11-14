@@ -20,6 +20,7 @@ import { testMachine } from './deployment.ts'
 
 export const MEMBER = 'ou_alice'
 export const CHAT = 'oc_team'
+export const PULL_HEAD_SHA = 'a'.repeat(40)
 
 /** Build a Feishu mention trigger from Alice in `oc_team`, using the digits in `id` as the timestamp offset in seconds. */
 export function feishu(id: string, text: string, overrides: Record<string, unknown> = {}): Trigger {
@@ -136,7 +137,17 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const directory = mkdtempSync(join(tmpdir(), 'orchestrator-host-'))
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')
   const repository = { default_branch: 'master', permissions: { push: true } }
-  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : repository)
+  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => {
+    if (args[1] === 'user') return { login: 'agent-bot' }
+    if (args[1] === 'graphql') return { data: { repository: { pullRequest: {
+      reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+    } } } }
+    const pull = args[1]?.match(/^repos\/acme\/widgets\/pulls\/(\d+)$/)
+    if (pull) return { number: Number(pull[1]), title: 'Fix regression', state: 'open',
+      html_url: `https://github.com/acme/widgets/pull/${pull[1]}`, user: { login: 'agent-bot', type: 'User' },
+      head: { sha: PULL_HEAD_SHA, ref: 'agent/fix-regression', repo: { full_name: 'acme/widgets' } } }
+    return repository
+  })
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
   vi.spyOn(Commands.prototype, 'git').mockResolvedValue('')
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')

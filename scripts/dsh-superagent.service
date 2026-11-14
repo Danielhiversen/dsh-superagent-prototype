@@ -1,0 +1,16 @@
+[Unit]
+Description=dsh-superagent (superagent profile)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/dahoiv/div/.local-npm/bin/dsh --profile superagent --no-open
+WorkingDirectory=/home/dahoiv/div/dsh-superagent-prototype
+Environment="PATH=/home/dahoiv/div/.local-npm/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="DSH_HOME=/home/dahoiv/div/.dsh"
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

@@ -2,7 +2,7 @@
 import { z } from 'zod'
 import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
-import { claimPull, readPull } from '../../sources/github-pull.ts'
+import { claimPull, pullClaimError, pullsOf, readPull, readReviewThreads, type Pull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
@@ -11,7 +11,7 @@ import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
 export interface ExecutorToolsHost {
-  readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
+  readonly engine: Pick<EngineForExecutor, 'report' | 'validateReport' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
   readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
   readonly resources: ResourceHost
@@ -22,9 +22,30 @@ export interface ExecutorToolsHost {
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
+  const pullNumbers = (current: Ticket) => {
+    const numbers = new Set(pullsOf(current, true))
+    const origin = host.github.triggers.get(current.origin.triggerId)
+    if (origin?.source === 'github' && origin.meta.isPr === true && typeof origin.meta.number === 'number') {
+      numbers.add(origin.meta.number)
+    }
+    return numbers
+  }
   return [
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
+    tool({
+      name: 'orchestrator_review_checklist',
+      description: 'Read the review checklist before changing a ticket PR. Includes resolved threads, which can still need fixes. Use the thread IDs in the ready report evidence.',
+      schema: z.object({ pr_number: z.number().int().positive(), offset: z.number().int().nonnegative().default(0) }).strict(),
+      execute: async ({ pr_number, offset }, signal) => {
+        const current = host.store.tickets.get(ticketId)
+        if (!current || !liveTicket(current) || !pullNumbers(current).has(pr_number)) throw new Error('PR does not belong to this open ticket')
+        const threads = await readReviewThreads(host.github, pr_number, signal)
+        const end = offset + 5
+        return { threads: threads.slice(offset, end).map(thread => ({ ...thread, body: thread.body.slice(0, 1600) })),
+          ...(end < threads.length ? { next_offset: end } : {}) }
+      },
+    }),
     tool({
       name: 'orchestrator_ack',
       description: 'Acknowledge one original human request before substantial work, as the replies section says; it posts as a reply to that message.',
@@ -80,24 +101,84 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
         pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
+        no_repository_changes: z.literal(true).optional()
+          .describe('For ready without a PR, attest that the assignment produced no repository changes, local or pushed.'),
+        verified_head_sha: z.string().regex(/^[0-9a-f]{40}$/).optional()
+          .describe('For ready with one open PR, the full SHA of the pushed commit you verified.'),
+        verified_heads: z.record(z.string().regex(/^[1-9][0-9]*$/), z.string().regex(/^[0-9a-f]{40}$/)).optional()
+          .describe('For ready with multiple open PRs, verified full commit SHAs keyed by PR number.'),
+        review_evidence: z.record(z.string(), z.string().trim().min(1).max(640)).optional()
+          .describe('For ready, map every review thread ID (including resolved ones) to the files and checks proving its feedback is addressed at the verified head.'),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
       }).strict(),
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
+        const report = { state: args.state, summary: args.summary,
+          ...(args.human_action !== undefined ? { question: args.human_action } : {}),
+          ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
+          ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
+        host.engine.validateReport(ticketId, report)
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
+        const claimError = pull && pullClaimError(host.github, ticketId, pull)
+        if (claimError) throw new Error(claimError)
+        const assignmentId = current.assignments.at(-1)?.id
+        const rejectReady = (message: string): never => {
+          const latest = host.store.tickets.get(ticketId)
+          if (latest && liveTicket(latest) && latest.assignments.at(-1)?.id === assignmentId) {
+            host.engine.report(ticketId, { state: 'progress', summary: message, readyRejected: true })
+          }
+          throw new Error(message)
+        }
+        if (args.state === 'ready') {
+          const numbers = pullNumbers(current)
+          if (pull?.state === 'open') numbers.add(pull.number)
+          const openPulls: Pull[] = []
+          for (const number of numbers) {
+            const before = pull?.number === number ? pull : await readPull(host.github, number, signal)
+            if (before.state === 'open') openPulls.push(before)
+          }
+          for (const before of openPulls) {
+            const number = before.number
+            const claimed = args.verified_heads?.[String(number)] ?? (openPulls.length === 1 ? args.verified_head_sha : undefined)
+            if (claimed !== before.head.sha) {
+              rejectReady(`PR #${number} head is ${before.head.sha}. Push your intended changes, verify that revision and its checks, and report its exact SHA in verified_head_sha or verified_heads.`)
+            }
+            const checklist = await readReviewThreads(host.github, number, signal)
+            const threads = checklist.filter(thread => !thread.resolved)
+            if (threads.length) {
+              rejectReady(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, resolve addressed threads with resolveReviewThread, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
+            }
+            const missing = checklist.filter(thread => !args.review_evidence?.[thread.id])
+            if (missing.length) {
+              rejectReady(`PR #${number} needs review evidence for ${missing.map(thread => thread.id).join(', ')}. Use orchestrator_review_checklist and verify the requested code and tests for each thread.`)
+            }
+            const after = await readPull(host.github, number, signal)
+            if (after.state !== 'open' || after.head.sha !== before.head.sha) {
+              rejectReady(`PR #${number} changed during verification. Check the current head and review threads again before reporting ready.`)
+            }
+          }
+          if (!openPulls.length && !args.no_repository_changes) {
+            rejectReady('Open a pull request for the repository changes and report its number and verified head SHA. A pushed branch alone is incomplete. Use no_repository_changes only for work that produced no repository changes.')
+          }
+        }
         // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
         return host.store.atomic(() => {
+          if (host.store.tickets.get(ticketId)?.assignments.at(-1)?.id !== assignmentId) {
+            throw new Error('Assignment changed during report verification')
+          }
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
-          const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
-            ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
-            ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
-          const updated = host.engine.report(ticketId, report)
+          const evidence = args.state === 'ready' && Object.entries(args.review_evidence ?? {})
+          const summary = evidence && evidence.length
+            ? [args.summary, 'Review evidence:', ...evidence.map(([id, detail]) => `${id}: ${detail}`)].join('\n')
+            : args.summary
+          const finalReport = { ...report, summary }
+          const updated = host.engine.report(ticketId, finalReport)
           const recorded = updated.assignments.at(-1)?.report
           const retrying = args.state === 'dropped' && !updated.ended && updated.assignments.at(-2)?.endedReason === 'reviewRetry'
             && !recorded
-          const relay = retrying ? undefined : reportRelay(updated, recorded ? { ...report, state: recorded.state } : report)
+          const relay = retrying ? undefined : reportRelay(updated, recorded ? { ...finalReport, state: recorded.state } : finalReport)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'
           return { reported: true, notification, ...retrying ? { retrying: true } : {}, ...(updated.attention ? { attention: updated.attention } : {}) }

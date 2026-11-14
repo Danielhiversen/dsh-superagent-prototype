@@ -15,6 +15,43 @@ const PullSchema = z.looseObject({
 export type Pull = z.infer<typeof PullSchema> & { number: number }
 export const readPull = async (ctx: SourceContext, number: number, signal?: AbortSignal): Promise<Pull> =>
   ({ ...await ctx.commands.withSignal(signal).api(PullSchema, `pulls/${number}`), number })
+const ReviewThreadsPage = z.object({ data: z.object({ repository: z.object({ pullRequest: z.object({
+  reviewThreads: z.object({
+    nodes: z.array(z.object({ id: z.string(), isResolved: z.boolean(), comments: z.object({
+      nodes: z.array(z.object({ url: z.string(), body: z.string() })),
+    }) })),
+    pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+  }),
+}) }) }) })
+
+/** Read GitHub review feedback, including threads that were already resolved. */
+export async function readReviewThreads(ctx: SourceContext, number: number, signal?: AbortSignal) {
+  const [owner, repo] = ctx.deployment.repository.split('/')
+  const commands = ctx.commands.withSignal(signal)
+  const query = `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $repo) { pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        nodes { id isResolved comments(first: 1) { nodes { url body } } }
+        pageInfo { hasNextPage endCursor }
+      }
+    } }
+  }`
+  const threads: { id: string; url: string; body: string; resolved: boolean }[] = []
+  let cursor: string | undefined
+  for (;;) {
+    const result = await commands.gh<unknown>(['api', 'graphql', '-f', `query=${query}`,
+      '-f', `owner=${owner}`, '-f', `repo=${repo}`, '-F', `number=${number}`, ...cursor ? ['-f', `cursor=${cursor}`] : []])
+    const { nodes, pageInfo } = ReviewThreadsPage.parse(result).data.repository.pullRequest.reviewThreads
+    for (const node of nodes) {
+      const comment = node.comments.nodes[0]
+      threads.push({ id: node.id, url: comment?.url ?? '', body: comment?.body ?? '', resolved: node.isResolved })
+    }
+    if (!pageInfo.hasNextPage) return threads
+    if (!pageInfo.endCursor || pageInfo.endCursor === cursor) throw new Error('GitHub review thread pagination did not advance')
+    cursor = pageInfo.endCursor
+  }
+}
+
 const pullNumber = (thread: string): number | undefined => thread.startsWith(`${SOURCE}:`) ? Number(thread.slice(SOURCE.length + 1)) : undefined
 export const pullsOf = (ticket: Pick<Ticket, 'follows'>, open = false): number[] =>
   (ticket.follows ?? []).filter(item => !open || !item.closed).flatMap(item => pullNumber(item.thread) ?? [])
@@ -29,10 +66,10 @@ export const ticketBranch = (ticket: Pick<Ticket, 'execution'>, ref: string): bo
 const AUTO_MERGE_ON: ThreadFact = { label: { zh: '自动合并', en: 'Auto-merge' }, value: { zh: '已开启', en: 'on' } }
 
 /**
- * Validates and binds an open PR to a ticket when the PR is either the ticket's origin PR or an agent-authored PR on the ticket's branch, enforcing that one PR binds to at most one open ticket.
- * Returns an error message when binding is rejected, or undefined when the PR is bound or when the PR is not open (which is not an error).
+ * Checks PR ownership without binding it: only the origin PR or an agent PR on the ticket's branch is eligible,
+ * and a PR can belong to at most one open ticket. Returns the rejection reason, if any.
  */
-export function claimPull(ctx: SourceContext, ticketId: string, pr: Pull): string | undefined {
+export function pullClaimError(ctx: SourceContext, ticketId: string, pr: Pull): string | undefined {
   const ticket = ctx.tickets.get(ticketId)
   if (!ticket || !liveTicket(ticket)) return 'Ticket ended because its PR was closed'
   const source = ctx.triggers.get(ticket.origin.triggerId)
@@ -44,6 +81,14 @@ export function claimPull(ctx: SourceContext, ticketId: string, pr: Pull): strin
   }
   const owner = ctx.tickets.open().find(item => pullsOf(item, true).includes(pr.number))
   if (owner && owner.id !== ticketId) return 'PR already belongs to another active ticket'
+  return undefined
+}
+/** Bind an eligible PR after checking ownership again at the point of mutation. */
+export function claimPull(ctx: SourceContext, ticketId: string, pr: Pull): string | undefined {
+  const error = pullClaimError(ctx, ticketId, pr)
+  if (error) return error
+  const ticket = ctx.tickets.get(ticketId)!
+  const opened = agentPull(pr, ctx.deployment) && ticketBranch(ticket, pr.head.ref)
   const follow = ticket.follows?.find(item => item.thread === `${SOURCE}:${pr.number}`)
   if (pr.state === 'open' && (!follow || follow.closed || (opened && !follow.own))) bind(ctx, ticketId, pr, opened)
   return undefined

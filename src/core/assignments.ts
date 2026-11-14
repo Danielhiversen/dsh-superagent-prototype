@@ -11,6 +11,7 @@ import { automatic, type Tickets } from './tickets.ts'
 export interface WorkerReport {
   state: ReportState
   summary: string
+  readyRejected?: boolean
   /** Open question for a person: a string asks it, `null` clears an open one, and `undefined` keeps the current one. */
   question?: string | null
   /** The person's message whose request raised the question; routes the question to the channel where it was written. */
@@ -91,12 +92,11 @@ export class Assignments extends EnginePart {
     else if (ticket.undelivered.length) this.options.executor.deliver(ticket, running)
   }
   /**
-   * Records a worker status report on an open ticket's current assignment, updating `attention`, `answers`, held automated
-   * inputs, and ending the ticket when `dropped` or when `ready` and not waiting on followed threads (`followsDone`).
+   * Validates a worker status report on an open ticket's current assignment without changing ticket state.
    * @throws UserError for an unknown or ended ticket, an ended assignment, a question combined with a ready result or answer,
    * or a question/answer referencing a non-human or unreached trigger.
    */
-  report(ticketId: string, report: WorkerReport): Ticket {
+  validateReport(ticketId: string, report: WorkerReport): void {
     const ticket = this.require(ticketId)
     if (!liveTicket(ticket)) throw new UserError('ticketEnded')
     if (report.question && (report.state === 'ready' || report.answers)) throw new UserError('questionWithResult')
@@ -110,6 +110,12 @@ export class Assignments extends EnginePart {
     const assignment = runningAssignment(ticket) ?? latestAssignment(ticket)
     if (!assignment) throw new UserError('unknownAssignment')
     if (assignment.state === 'ended') throw new UserError('assignmentEnded')
+  }
+  /** Validate and record a report, preserving the current assignment when validation fails. */
+  report(ticketId: string, report: WorkerReport): Ticket {
+    this.validateReport(ticketId, report)
+    const ticket = this.require(ticketId)
+    const assignment = (runningAssignment(ticket) ?? latestAssignment(ticket))!
     const at = this.now()
     const previous = ticket.attention
     const ask = (question: string) => ({ id: key('attention', ticketId, question, at), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })
@@ -125,23 +131,26 @@ export class Assignments extends EnginePart {
         && ['conversation', 'inline', 'review'].includes(String(trigger.meta.kind))
     }
     const openPull = ticket.follows?.some(follow => follow.thread.startsWith('github:') && !follow.closed)
-    const retryReview = report.state === 'dropped' && !attention && openPull
+    if (report.readyRejected) assignment.readyRejection = report.summary
+    if (['ready', 'blocked', 'failed'].includes(report.state) || attention) delete assignment.readyRejection
+    const rejected = report.state === 'waiting' && !attention ? assignment.readyRejection : undefined
+    const retryReview = rejected !== undefined || report.state === 'dropped' && !attention && openPull
       && (review(ticket.origin.triggerId) || ticket.inputs.some(input => input.kind === 'trigger'
         && input.deliveredTo === assignment.id && review(input.triggerId))
         || ticket.assignments.at(-2)?.endedReason === 'reviewRetry')
     const previousRetries = ticket.assignments.slice(0, -1).reverse().findIndex(item => item.endedReason !== 'reviewRetry')
     const retries = previousRetries < 0 ? ticket.assignments.length - 1 : previousRetries
     const state = retryReview ? retries < 2 ? 'progress' : 'failed' : report.state
-    assignment.report = { state, summary: report.summary, at }
+    assignment.report = { state, summary: rejected ?? report.summary, at }
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
     if (report.answers) this.takeUp(ticketId, report.answers)
-    if (report.state === 'blocked' || report.state === 'failed') ticket.undelivered = ticket.undelivered.filter(id => !automatic(ticket.inputs.find(input => input.id === id)))
+    if (state === 'blocked' || state === 'failed') ticket.undelivered = ticket.undelivered.filter(id => !automatic(ticket.inputs.find(input => input.id === id)))
     this.repo.tickets.save(ticket)
     if (retryReview && state === 'progress') {
       this.options.executor.stop(ticket, assignment, 'reviewRetry')
       this.tickets.restart(ticket, assignment, 'reviewRetry',
-        `Continue the open PR review. Previous report: ${report.summary.slice(0, 1500)}. Inspect the current worktree and remote PR, finish remaining fixes, test, push and verify the remote head, then resolve the addressed review threads and verify their status. Report blocked with a concrete human action if you cannot proceed.`)
+        `Continue the unfinished assignment. Previous report: ${(rejected ?? report.summary).slice(0, 1500)}. Inspect the current worktree and remote PR, finish remaining fixes, test, push and verify the remote head, open the ticket PR if required, then resolve any addressed review threads and verify their status. Report blocked with a concrete human action if you cannot proceed.`)
       return this.require(ticketId)
     }
     // A ticket that follows Threads ends with them: a ready report ends it only once followsDone holds, with that outcome.

@@ -34,6 +34,7 @@ Do not loop indefinitely, bypass safety or permissions, or claim success for an 
 Report a real blocker internally with evidence, attempted remedies and the specific missing prerequisite.
 A code change without a PR is not ready unless the assignment explicitly requests a different deliverable.
 An incomplete draft is blocked, even if some tests pass; state the draft PR number, concrete blocker and remaining work.
+Before creating a new issue or feature branch, fetch origin, switch to main and run `git pull --ff-only origin main`. Only create the branch from main after that succeeds and main equals origin/main. Apply this again when reusing a ticket workspace; never branch from the previous task or a stale ref. Preserve unfinished work by using a separate clean clone or worktree when needed. If updating main fails, stop branch creation and report the error. Review or fix an existing PR from its own head without replacing its history.
 Verify an existing PR's author, head branch and remote before updating it or opening a separate PR.
 Do not delete ticket directories or rewrite unrelated branches.
 Review changes and run relevant checks.
