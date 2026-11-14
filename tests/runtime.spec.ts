@@ -1557,14 +1557,17 @@ it('relays the status-request hint when a worker\'s turn ends with no text and n
 it('tries every catalog route once on rate limits or insufficient balance, with the configured backup first', async () => {
   const primary = { provider: 'primary', model: 'main' }
   const fallback = { provider: 'backup', model: 'preferred' }
-  const alternatives = ['a', 'b', 'c', 'd'].map(model => ({ provider: 'backup', model }))
+  const hosted = ['a', 'b', 'c'].map(model => ({ provider: 'backup', model }))
+  const local = { provider: 'ollama-local', model: 'd' }
+  const alternatives = [...hosted, local]
   const settings = runtime.store.settings()
   runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, model: primary, fallbackModel: fallback } })
   Object.assign(controller, { modelCatalog: vi.fn(async () => ({
     default: primary,
     groups: [
       { id: primary.provider, models: [{ id: primary.model }] },
-      { id: fallback.provider, models: [{ id: fallback.model }, ...alternatives.map(route => ({ id: route.model }))] },
+      { id: local.provider, models: [{ id: local.model }] },
+      { id: fallback.provider, models: [{ id: fallback.model }, ...hosted.map(route => ({ id: route.model }))] },
     ],
   })) })
   const { ticket, sessionId } = await acceptedTicket()

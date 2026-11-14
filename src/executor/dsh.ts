@@ -617,10 +617,12 @@ export class DshExecutor implements Executor {
       const { model, fallbackModel } = this.host.store.settings().executor
       const current = agent.session.requestHeader()?.config ?? model ?? catalog.default
       if (current) chain.tried.add(modelKey(current))
-      chain.candidates = [
+      const routes = [
         ...(fallbackModel ? [fallbackModel] : []),
         ...catalog.groups.flatMap(group => group.models.map(item => ({ provider: group.id, model: item.id }))),
       ]
+      const local = (route: ModelRoute) => /^ollama(?:-|$)/i.test(route.provider)
+      chain.candidates = [...routes.filter(route => !local(route)), ...routes.filter(local)]
     }
     for (const candidate of chain.candidates) {
       const key = modelKey(candidate)
