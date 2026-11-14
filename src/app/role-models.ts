@@ -15,8 +15,12 @@ export async function resolveRoleModel(ctx: Context, model: RoleModel): Promise<
 export async function initializeRoleModel(ctx: Context, agent: Agent, model: RoleModel | null): Promise<void> {
   if (!model) return
   if (agent.session.requestHeader() || agent.session.snapshotEvents().some(event => event.type === 'model/selection')) return
-  const selected = await resolveRoleModel(ctx, model)
-  // Avoid selectModel because it mutates the global DSH default; inject the selection for the initial request only.
+  await selectRoleModel(ctx, agent, await resolveRoleModel(ctx, model))
+}
+
+/** Apply a resolved model to one session without changing the global default. */
+export async function selectRoleModel(ctx: Context, agent: Agent, selected: ModelSelection): Promise<void> {
+  // Avoid selectModel because it mutates the global DSH default; apply this selection only until the next request records it.
   agent.session.append('model/selection', selected)
   let initial = true
   let assembled: ModelSelection | undefined

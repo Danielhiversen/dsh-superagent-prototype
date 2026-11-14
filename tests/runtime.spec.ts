@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
-import type { UserMessage } from '@deepseek-ai/dsh-llm'
+import { LlmError, type UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
 import { jobRegistry } from './fixtures/host.ts'
@@ -1552,6 +1552,23 @@ it('relays the status-request hint when a worker\'s turn ends with no text and n
   await vi.waitFor(() => expect(runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'waiting' }))
   expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', ticket: { ticket_id: ticket.id }, state: 'waiting',
     summary: expect.stringContaining('orchestrator_ticket_request_status') })
+})
+
+it('resumes the same worker on its configured backup when the model returns HTTP 429', async () => {
+  const fallback = { provider: 'backup', model: 'backup-model' }
+  const settings = runtime.store.settings()
+  runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, fallbackModel: fallback } })
+  const { ticket, sessionId } = await acceptedTicket()
+  const agent = agents.get(sessionId)!
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    const ctx = (runtime as unknown as { ctx: Context }).ctx
+    ctx.emit('agent/error', { agent, turn: 1, step: 1, error: new LlmError('Too Many Requests', 'RATE_LIMIT', { status: 429 }) } as never)
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect((agent as unknown as import('@deepseek-ai/dsh-agent').Agent).session.snapshotEvents()).toContainEqual({ type: 'model/selection', data: fallback })
+    expect(deliveries.mock.calls.filter(([call]) => call.sessionId === sessionId)).toHaveLength(2)
+    expect(runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.report).toBeUndefined()
+  } finally { vi.useRealTimers() }
 })
 
 it('fails a ticket at once on a worker error that is not passing, and relays it', async () => {

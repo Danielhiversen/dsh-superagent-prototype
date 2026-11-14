@@ -9,7 +9,9 @@ import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Execu
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
-import type { Settings } from '../policy.ts'
+import type { RoleModel, Settings } from '../policy.ts'
+import { LlmError } from '@deepseek-ai/dsh-llm'
+import { resolveRoleModel, selectRoleModel } from '../app/role-models.ts'
 import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
@@ -48,7 +50,8 @@ const PASSING = new RegExp(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAI
  * connection that was refused, reset, timed out, or could not resolve its host.
  */
 export function transient(error: unknown): boolean {
-  const status = (error as { status?: unknown } | undefined)?.status
+  if (error instanceof LlmError && error.failure.code === 'RATE_LIMIT') return true
+  const status = error instanceof LlmError ? error.failure.status : (error as { status?: unknown } | undefined)?.status
   if (typeof status === 'number') return status === 408 || status === 429 || status >= 500
   const text = error instanceof Error ? `${error.name} ${error.message} ${String((error as { code?: unknown }).code ?? '')}` : String(error)
   return PASSING.test(text)
@@ -506,7 +509,12 @@ export class DshExecutor implements Executor {
       const ticket = this.ticketOf(agent)
       const assignment = ticket && runningAssignment(ticket)
       if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing()) return
-      if (this.retries(assignment.id, error)) { this.resumeAfter(ticket.id, assignment.id, error); return }
+      if (this.retries(assignment.id, error)) {
+        const limited = error instanceof LlmError && (error.failure.status === 429 || error.failure.code === 'RATE_LIMIT')
+        const fallback = limited ? this.host.store.settings().executor.fallbackModel : null
+        this.resumeAfter(ticket.id, assignment.id, error, fallback ? { agent, model: fallback } : undefined)
+        return
+      }
       void this.background(Promise.resolve().then(() => { this.failed(ticket.id, String(error)) }))
     }))
   }
@@ -552,14 +560,17 @@ export class DshExecutor implements Executor {
     return true
   }
   /** Schedules a worker turn retry with exponential backoff after a transient provider or network error. */
-  private resumeAfter(ticketId: string, assignmentId: string, error: unknown): void {
+  private resumeAfter(ticketId: string, assignmentId: string, error: unknown, fallback?: { agent: Agent; model: RoleModel }): void {
     const tries = this.transient.get(assignmentId)!
     const text = `Your last turn failed for a passing reason (${String(error).slice(0, 200)}). Continue the assignment where it stopped.`
     this.resuming.add(assignmentId)
-    const go = () => {
-      if (this.host.closing()) return
+    const live = () => {
       const ticket = this.host.store.tickets.get(ticketId)
-      if (!ticket || !liveTicket(ticket) || runningAssignment(ticket)?.id !== assignmentId) { this.resuming.delete(assignmentId); return }
+      return ticket && liveTicket(ticket) && runningAssignment(ticket)?.id === assignmentId && !this.host.closing() ? ticket : undefined
+    }
+    const go = () => {
+      const ticket = live()
+      if (!ticket) { this.resuming.delete(assignmentId); return }
       // Wait while processing is paused or no wake slot is free.
       if (this.host.paused()) { this.after(SLOT_WAIT_MS, go); return }
       const sessionId = workerSessionId(ticketId)
@@ -568,9 +579,22 @@ export class DshExecutor implements Executor {
         if (!(failure instanceof Later)) throw failure
         this.after(SLOT_WAIT_MS, go); return
       }
-      const sent = this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue')
+      const sent = (async () => {
+        if (fallback) {
+          const { agent, model } = fallback
+          const selected = await resolveRoleModel(this.host.context, model)
+          const current = agent.session.requestHeader()?.config
+          if (selected.provider !== current?.provider || selected.model !== current?.model) {
+            if (!live() || this.host.context.agents.get(agent.id) !== agent) return
+            await selectRoleModel(this.host.context, agent, selected)
+          }
+        }
+        if (live()) {
+          await this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue')
+        }
+      })()
       void this.background(sent.finally(() => { if (waking) this.slots.free(ticketId); this.resuming.delete(assignmentId) })
-        .catch(failure => { this.failed(ticketId, String(failure)) }))
+        .catch(failure => { if (live()) this.failed(ticketId, String(failure)) }))
     }
     this.after(TRANSIENT_BACKOFF_MS * 2 ** (tries - 1), go)
   }

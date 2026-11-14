@@ -159,8 +159,11 @@ export class Settings {
     const candidate = rules.merge(current, parsed, id)
     const model = block === 'eval' ? candidate.eval.model : block === 'executor' ? candidate.executor.model : null
     const previous = block === 'eval' ? current.eval.model : block === 'executor' ? current.executor.model : null
-    if (model && JSON.stringify(model) !== JSON.stringify(previous)) {
-      try { await resolveRoleModel(this.host.context, model) }
+    const changedModels = [[model, previous], ...(block === 'executor'
+      ? [[candidate.executor.fallbackModel, current.executor.fallbackModel]] : [])]
+    for (const [next, prior] of changedModels) {
+      if (!next || JSON.stringify(next) === JSON.stringify(prior)) continue
+      try { await resolveRoleModel(this.host.context, next) }
       catch (error) { throw new UserError('modelUnavailable', { block, error: error instanceof Error ? error.message : String(error) }) }
     }
     rules.guard?.(current, candidate, origin)
