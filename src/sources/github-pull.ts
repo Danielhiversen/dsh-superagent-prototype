@@ -52,6 +52,19 @@ export async function readReviewThreads(ctx: SourceContext, number: number, sign
   }
 }
 
+const ResolvedReviewThread = z.object({ data: z.object({ resolveReviewThread: z.object({
+  thread: z.object({ id: z.string(), isResolved: z.literal(true) }),
+}) }) })
+
+export async function resolveReviewThread(ctx: SourceContext, id: string, signal?: AbortSignal): Promise<void> {
+  const mutation = `mutation($id: ID!) {
+    resolveReviewThread(input: { threadId: $id }) { thread { id isResolved } }
+  }`
+  const result = await ctx.commands.withSignal(signal).gh<unknown>(['api', 'graphql', '-f', `query=${mutation}`, '-f', `id=${id}`])
+  const thread = ResolvedReviewThread.parse(result).data.resolveReviewThread.thread
+  if (thread.id !== id) throw new Error(`GitHub returned a different thread while resolving ${id}`)
+}
+
 const pullNumber = (thread: string): number | undefined => thread.startsWith(`${SOURCE}:`) ? Number(thread.slice(SOURCE.length + 1)) : undefined
 export const pullsOf = (ticket: Pick<Ticket, 'follows'>, open = false): number[] =>
   (ticket.follows ?? []).filter(item => !open || !item.closed).flatMap(item => pullNumber(item.thread) ?? [])

@@ -10,3 +10,25 @@
 # Feishu is optional: uncomment to enable its Source, then set the bot's lark-cli on the Feishu Source.
 # - id: dsh-superagent-feishu
 #   disabled: false
+
+# Optional hosted fallback. The executor tries hosted routes before Ollama.
+# Kilo Auto Free supports anonymous requests and is subject to promotion limits.
+# - id: llm-pi-ai
+#   config:
+#     providers:
+#       kilo-free:
+#         displayName: Kilo Free
+#         api: openai-completions
+#         baseURL: https://ai-gateway.kilo.ai/api/v1
+#         headers:
+#           Authorization: Bearer anonymous
+#         compat:
+#           supportsDeveloperRole: false
+#           maxTokensField: max_tokens
+#         models:
+#         - id: kilo-auto/free
+#           name: Kilo Auto Free
+#           contextWindow: 131072
+#           maxTokens: 8192
+#           input:
+#           - text

@@ -400,6 +400,35 @@ it.each([false, true])('requires resolved review threads and evidence before rea
   }
 })
 
+it('resolves only selected review threads after checking the pushed head', async () => {
+  const { sessionId } = await acceptedTicket()
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'PR open', pr_number: 42 })
+  const previous = vi.mocked(Commands.prototype.gh).getMockImplementation()!
+  const resolved = new Set(['already'])
+  vi.mocked(Commands.prototype.gh).mockImplementation(async (...args) => {
+    if (args[0][1] !== 'graphql') return previous(...args)
+    if (args[0].some(arg => arg.includes('resolveReviewThread'))) {
+      const id = args[0].find(arg => arg.startsWith('id='))!.slice(3)
+      resolved.add(id)
+      return { data: { resolveReviewThread: { thread: { id, isResolved: true } } } }
+    }
+    return { data: { repository: { pullRequest: { reviewThreads: {
+      nodes: ['fixed', 'already', 'outstanding'].map(id => ({ id, isResolved: resolved.has(id), comments: { nodes: [] } })),
+      pageInfo: { hasNextPage: false, endCursor: null },
+    } } } } }
+  })
+  const resolve = (head: string, ids: string[], pr = 42) => runTool(sessionId, 'orchestrator_resolve_review_threads', {
+    pr_number: pr, verified_head_sha: head.repeat(40), thread_ids: ids,
+  })
+  await expect(resolve('b', ['fixed'])).rejects.toThrow('head')
+  await expect(resolve('a', ['fixed', 'foreign'])).rejects.toThrow('foreign')
+  await expect(resolve('a', ['fixed'], 41)).rejects.toThrow('does not belong')
+  expect([...resolved]).toEqual(['already'])
+  await expect(resolve('a', ['fixed', 'already'])).resolves.toMatchObject({ resolved: ['fixed', 'already'] })
+  expect([...resolved]).toEqual(['already', 'fixed'])
+  await expect(resolve('a', ['fixed'])).resolves.toMatchObject({ resolved: ['fixed'] })
+})
+
 it('rejects ready when the remote PR head changes during review verification', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   const previous = vi.mocked(Commands.prototype.gh).getMockImplementation()!

@@ -2,7 +2,7 @@
 import { z } from 'zod'
 import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
-import { claimPull, pullClaimError, pullsOf, readPull, readReviewThreads, type Pull } from '../../sources/github-pull.ts'
+import { claimPull, pullClaimError, pullsOf, readPull, readReviewThreads, resolveReviewThread, type Pull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
@@ -35,7 +35,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
     tool({
       name: 'orchestrator_review_checklist',
-      description: 'Read the review checklist before changing a ticket PR. Includes resolved threads, which can still need fixes. Use the thread IDs in the ready report evidence.',
+      description: 'Read ticket PR review threads, including resolved ones. Use their IDs for resolution and ready evidence.',
       schema: z.object({ pr_number: z.number().int().positive(), offset: z.number().int().nonnegative().default(0) }).strict(),
       execute: async ({ pr_number, offset }, signal) => {
         const current = host.store.tickets.get(ticketId)
@@ -44,6 +44,45 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         const end = offset + 5
         return { threads: threads.slice(offset, end).map(thread => ({ ...thread, body: thread.body.slice(0, 1600) })),
           ...(end < threads.length ? { next_offset: end } : {}) }
+      },
+    }),
+    tool({
+      name: 'orchestrator_resolve_review_threads',
+      description: 'Resolve addressed checklist threads at the verified pushed head.',
+      schema: z.object({
+        pr_number: z.number().int().positive(),
+        verified_head_sha: z.string().regex(/^[0-9a-f]{40}$/),
+        thread_ids: z.array(z.string().min(1)).min(1).max(100),
+      }).strict(),
+      execute: async ({ pr_number, verified_head_sha, thread_ids }, signal) => {
+        const current = host.store.tickets.get(ticketId)
+        if (!current || !liveTicket(current) || !pullNumbers(current).has(pr_number)) {
+          throw new Error('PR does not belong to this open ticket')
+        }
+        const assignmentId = current.assignments.at(-1)?.id
+        const verifyHead = async () => {
+          const pull = await readPull(host.github, pr_number, signal)
+          const latest = host.store.tickets.get(ticketId)
+          if (!latest || !liveTicket(latest) || latest.assignments.at(-1)?.id !== assignmentId) {
+            throw new Error('Assignment changed during review resolution')
+          }
+          const error = pullClaimError(host.github, ticketId, pull)
+          if (error) throw new Error(error)
+          if (pull.state !== 'open' || pull.head.sha !== verified_head_sha) {
+            throw new Error(`PR #${pr_number} is ${pull.state} at head ${pull.head.sha}. Verify the current open PR head before resolving threads.`)
+          }
+        }
+        await verifyHead()
+        const checklist = new Map((await readReviewThreads(host.github, pr_number, signal)).map(thread => [thread.id, thread]))
+        const ids = [...new Set(thread_ids)]
+        const unknown = ids.filter(id => !checklist.has(id))
+        if (unknown.length) throw new Error(`Threads do not belong to PR #${pr_number}: ${unknown.join(', ')}`)
+        for (const id of ids) {
+          if (checklist.get(id)?.resolved) continue
+          await verifyHead()
+          await resolveReviewThread(host.github, id, signal)
+        }
+        return { resolved: ids }
       },
     }),
     tool({
@@ -102,13 +141,13 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
         pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
         no_repository_changes: z.literal(true).optional()
-          .describe('For ready without a PR, attest that the assignment produced no repository changes, local or pushed.'),
+          .describe('For ready without a PR, attest to no local or pushed repository changes.'),
         verified_head_sha: z.string().regex(/^[0-9a-f]{40}$/).optional()
           .describe('For ready with one open PR, the full SHA of the pushed commit you verified.'),
         verified_heads: z.record(z.string().regex(/^[1-9][0-9]*$/), z.string().regex(/^[0-9a-f]{40}$/)).optional()
-          .describe('For ready with multiple open PRs, verified full commit SHAs keyed by PR number.'),
+          .describe('Verified SHAs by PR number when reporting ready for multiple PRs.'),
         review_evidence: z.record(z.string(), z.string().trim().min(1).max(640)).optional()
-          .describe('For ready, map every review thread ID (including resolved ones) to the files and checks proving its feedback is addressed at the verified head.'),
+          .describe('For ready, map all review thread IDs to files and checks proving each fix at the verified head.'),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
       }).strict(),
       execute: async (args, signal) => {
@@ -147,7 +186,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
             const checklist = await readReviewThreads(host.github, number, signal)
             const threads = checklist.filter(thread => !thread.resolved)
             if (threads.length) {
-              rejectReady(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, resolve addressed threads with resolveReviewThread, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
+              rejectReady(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, resolve addressed threads with orchestrator_resolve_review_threads, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
             }
             const missing = checklist.filter(thread => !args.review_evidence?.[thread.id])
             if (missing.length) {
