@@ -863,6 +863,42 @@ describe('github source', () => {
     expect(reads.filter(path => path.includes('/comments'))).toEqual([`issues/12/comments?per_page=100&since=${since}`])
     h.store.close()
   })
+  it('assesses conversation comments, inline comments, and submitted reviews on open agent-owned PRs', async () => {
+    const h = host()
+    const settings = h.store.settings()
+    h.store.saveSettings({ ...settings, sources: { github: { enabled: true, config: { addressOwnPullReviews: true } } } })
+    const own = agentsPull(12, 'fix')
+    const timestamp = new Date(Date.now() + 1000).toISOString()
+    const comment = { id: 5, body: 'Please fix the regression', user: { login: 'alice', type: 'User' }, updated_at: timestamp }
+    const routes: Record<string, unknown> = { notifications: [], pulls: [own, openPull(13)],
+      'pulls/12': own, 'pulls/13': openPull(13), 'issues/12/comments': [comment, { ...comment, id: 9, user: own.user }],
+      'pulls/12/comments': [{ ...comment, id: 6 }],
+      'pulls/12/reviews': [{ id: 7, user: comment.user, submitted_at: timestamp, state: 'CHANGES_REQUESTED' },
+        { id: 8, user: comment.user, updated_at: timestamp, state: 'PENDING', body: 'Draft' }],
+      'issues/13/comments': [comment] }
+    github(h, routes)
+    await pollRound(h)
+    const triggers = h.receive.mock.calls.map(([trigger]) => trigger)
+    expect(triggers.map(trigger => [trigger.meta.number, trigger.meta.commentId])).toEqual([[12, 5], [12, 6], [12, 7]])
+    expect(h.engine.candidate(triggers[0]!.id)?.strength).toBe('explicit')
+    h.store.close()
+  })
+  it('reads a PR mention posted before the checkpoint when its notification arrives late', async () => {
+    const h = host()
+    const checkpoint = new Date(Date.now() - 60_000).toISOString()
+    const posted = new Date(Date.now() - 5 * 60_000).toISOString()
+    h.store.set('github-since', checkpoint)
+    const comment: GithubComment = { id: 5, body: '@agent-bot address the review',
+      user: { login: 'alice', type: 'User' },
+      html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-5', created_at: posted, updated_at: posted }
+    const reads = github(h, { notifications: [{ ...notification(12, 'pulls'), updated_at: new Date().toISOString() }],
+      'pulls/12': openPull(12), 'issues/12/comments': [comment, { ...comment, id: 6, body: 'Unrelated old comment' }] })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.commentId)).toEqual([5])
+    const request = reads.find(path => path.startsWith('issues/12/comments?'))!
+    expect(Date.parse(new URL(request, 'https://example.com').searchParams.get('since')!)).toBeLessThan(Date.parse(posted))
+    h.store.close()
+  })
   it('keeps one body Trigger for an Issue that a later poll reads again', async () => {
     const h = host()
     // Opened just before the poll, the Issue is still after the cursor the next poll reads from.

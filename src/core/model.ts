@@ -115,6 +115,7 @@ interface Received { source?: string; scope?: Record<string, unknown>; row?: str
  */
 export type MandateBasis = Received & { sender?: string; rules?: string[] } & (
   | { via: 'addressed'; addressed: 'mention' | 'direct' }
+  | { via: 'trustedReview' }
   | { via: 'followup'; authority?: string }
   | { via: 'admission'; cell: AdmissionCell; addressed?: 'mention' | 'direct'; observation?: { mode: AcceptMode } }
   | { via: 'listed'; addressed?: 'mention' | 'direct'; observation?: { mode?: AcceptMode }; authority?: string }
