@@ -15,6 +15,40 @@ const PullSchema = z.looseObject({
 export type Pull = z.infer<typeof PullSchema> & { number: number }
 export const readPull = async (ctx: SourceContext, number: number, signal?: AbortSignal): Promise<Pull> =>
   ({ ...await ctx.commands.withSignal(signal).api(PullSchema, `pulls/${number}`), number })
+const ReviewThreadsPage = z.object({ data: z.object({ repository: z.object({ pullRequest: z.object({
+  reviewThreads: z.object({
+    nodes: z.array(z.object({ id: z.string(), isResolved: z.boolean(), comments: z.object({
+      nodes: z.array(z.object({ url: z.string() })),
+    }) })),
+    pageInfo: z.object({ hasNextPage: z.boolean(), endCursor: z.string().nullable() }),
+  }),
+}) }) }) })
+
+/** Enumerate unresolved GitHub review threads, including outdated threads. */
+export async function openReviewThreads(ctx: SourceContext, number: number, signal?: AbortSignal) {
+  const [owner, repo] = ctx.deployment.repository.split('/')
+  const commands = ctx.commands.withSignal(signal)
+  const query = `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+    repository(owner: $owner, name: $repo) { pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        nodes { id isResolved comments(first: 1) { nodes { url } } }
+        pageInfo { hasNextPage endCursor }
+      }
+    } }
+  }`
+  const unresolved: { id: string; url: string }[] = []
+  let cursor: string | undefined
+  for (;;) {
+    const result = await commands.gh<unknown>(['api', 'graphql', '-f', `query=${query}`,
+      '-f', `owner=${owner}`, '-f', `repo=${repo}`, '-F', `number=${number}`, ...cursor ? ['-f', `cursor=${cursor}`] : []])
+    const { nodes, pageInfo } = ReviewThreadsPage.parse(result).data.repository.pullRequest.reviewThreads
+    for (const node of nodes) if (!node.isResolved) unresolved.push({ id: node.id, url: node.comments.nodes[0]?.url ?? '' })
+    if (!pageInfo.hasNextPage) return unresolved
+    if (!pageInfo.endCursor || pageInfo.endCursor === cursor) throw new Error('GitHub review thread pagination did not advance')
+    cursor = pageInfo.endCursor
+  }
+}
+
 const pullNumber = (thread: string): number | undefined => thread.startsWith(`${SOURCE}:`) ? Number(thread.slice(SOURCE.length + 1)) : undefined
 export const pullsOf = (ticket: Pick<Ticket, 'follows'>, open = false): number[] =>
   (ticket.follows ?? []).filter(item => !open || !item.closed).flatMap(item => pullNumber(item.thread) ?? [])

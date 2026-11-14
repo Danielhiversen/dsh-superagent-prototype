@@ -2,7 +2,7 @@
 import { z } from 'zod'
 import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
-import { claimPull, readPull } from '../../sources/github-pull.ts'
+import { claimPull, openReviewThreads, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
@@ -86,6 +86,17 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
+        if (args.state === 'ready') {
+          const numbers = new Set((current.follows ?? []).flatMap(follow =>
+            !follow.closed && /^github:[0-9]+$/.test(follow.thread) ? [Number(follow.thread.slice(7))] : []))
+          if (pull?.state === 'open') numbers.add(pull.number)
+          for (const number of numbers) {
+            const threads = await openReviewThreads(host.github, number, signal)
+            if (threads.length) {
+              throw new Error(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, resolve addressed threads with resolveReviewThread, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
+            }
+          }
+        }
         // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
         return host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
