@@ -1554,7 +1554,7 @@ it('relays the status-request hint when a worker\'s turn ends with no text and n
     summary: expect.stringContaining('orchestrator_ticket_request_status') })
 })
 
-it('tries every catalog route once after HTTP 429, with the configured backup first', async () => {
+it('tries every catalog route once on rate limits or insufficient balance, with the configured backup first', async () => {
   const primary = { provider: 'primary', model: 'main' }
   const fallback = { provider: 'backup', model: 'preferred' }
   const alternatives = ['a', 'b', 'c', 'd'].map(model => ({ provider: 'backup', model }))
@@ -1571,7 +1571,8 @@ it('tries every catalog route once after HTTP 429, with the configured backup fi
   const agent = agents.get(sessionId)! as unknown as import('@deepseek-ai/dsh-agent').Agent
   const selected = () => agent.session.snapshotEvents().filter(event => event.type === 'model/selection').map(event => event.data)
   const ctx = (runtime as unknown as { ctx: Context }).ctx
-  const fail = (turn: number) => ctx.emit('agent/error', { agent, turn, step: 1, error: new LlmError('Too Many Requests', 'RATE_LIMIT', { status: 429 }) })
+  const fail = (turn: number) => ctx.emit('agent/error', { agent, turn, step: 1, error: turn === 1 || turn === 6 ? new LlmError('Too Many Requests', 'RATE_LIMIT', { status: 429 })
+    : new LlmError('Insufficient Balance (request_id: example)', 'HTTP_ERROR', { status: 402 }) })
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
   try {
     for (const [index, route] of [fallback, ...alternatives].entries()) {

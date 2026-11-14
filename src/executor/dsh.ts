@@ -514,8 +514,9 @@ export class DshExecutor implements Executor {
       const ticket = this.ticketOf(agent)
       const assignment = ticket && runningAssignment(ticket)
       if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing()) return
-      const limited = error instanceof LlmError && (error.failure.status === 429 || error.failure.code === 'RATE_LIMIT')
-      if (limited) {
+      const switchModel = error instanceof LlmError && (error.failure.status === 429 || error.failure.code === 'RATE_LIMIT'
+        || error.failure.status === 402 || /\binsufficient balance\b/i.test(error.failure.message))
+      if (switchModel) {
         const chain = this.failover.get(assignment.id) ?? { attempts: 0, tried: new Set<string>() }
         this.failover.set(assignment.id, chain)
         this.resumeAfter(ticket.id, assignment.id, error, { agent, chain })
