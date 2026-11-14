@@ -2,7 +2,7 @@
 import { z } from 'zod'
 import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
-import { claimPull, openReviewThreads, readPull } from '../../sources/github-pull.ts'
+import { claimPull, pullsOf, readPull, readReviewThreads } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
@@ -22,9 +22,30 @@ export interface ExecutorToolsHost {
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
+  const pullNumbers = (current: Ticket) => {
+    const numbers = new Set(pullsOf(current, true))
+    const origin = host.github.triggers.get(current.origin.triggerId)
+    if (origin?.source === 'github' && origin.meta.isPr === true && typeof origin.meta.number === 'number') {
+      numbers.add(origin.meta.number)
+    }
+    return numbers
+  }
   return [
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
+    tool({
+      name: 'orchestrator_review_checklist',
+      description: 'Read the review checklist before changing a ticket PR. Includes resolved threads, which can still need fixes. Use the thread IDs in the ready report evidence.',
+      schema: z.object({ pr_number: z.number().int().positive(), offset: z.number().int().nonnegative().default(0) }).strict(),
+      execute: async ({ pr_number, offset }, signal) => {
+        const current = host.store.tickets.get(ticketId)
+        if (!current || !liveTicket(current) || !pullNumbers(current).has(pr_number)) throw new Error('PR does not belong to this open ticket')
+        const threads = await readReviewThreads(host.github, pr_number, signal)
+        const end = offset + 5
+        return { threads: threads.slice(offset, end).map(thread => ({ ...thread, body: thread.body.slice(0, 1600) })),
+          ...(end < threads.length ? { next_offset: end } : {}) }
+      },
+    }),
     tool({
       name: 'orchestrator_ack',
       description: 'Acknowledge one original human request before substantial work, as the replies section says; it posts as a reply to that message.',
@@ -84,6 +105,8 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           .describe('For ready with one open PR, the full SHA of the pushed commit you verified.'),
         verified_heads: z.record(z.string().regex(/^[1-9][0-9]*$/), z.string().regex(/^[0-9a-f]{40}$/)).optional()
           .describe('For ready with multiple open PRs, verified full commit SHAs keyed by PR number.'),
+        review_evidence: z.record(z.string(), z.string().trim().min(1).max(640)).optional()
+          .describe('For ready, map every review thread ID (including resolved ones) to the files and checks proving its feedback is addressed at the verified head.'),
         reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
       }).strict(),
       execute: async (args, signal) => {
@@ -91,8 +114,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
         if (args.state === 'ready') {
-          const numbers = new Set((current.follows ?? []).flatMap(follow =>
-            !follow.closed && /^github:[0-9]+$/.test(follow.thread) ? [Number(follow.thread.slice(7))] : []))
+          const numbers = pullNumbers(current)
           if (pull?.state === 'open') numbers.add(pull.number)
           for (const number of numbers) {
             const before = pull?.number === number ? pull : await readPull(host.github, number, signal)
@@ -101,9 +123,14 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
             if (claimed !== before.head.sha) {
               throw new Error(`PR #${number} head is ${before.head.sha}. Push your intended changes, verify that revision and its checks, and report its exact SHA in verified_head_sha or verified_heads.`)
             }
-            const threads = await openReviewThreads(host.github, number, signal)
+            const checklist = await readReviewThreads(host.github, number, signal)
+            const threads = checklist.filter(thread => !thread.resolved)
             if (threads.length) {
               throw new Error(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, resolve addressed threads with resolveReviewThread, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
+            }
+            const missing = checklist.filter(thread => !args.review_evidence?.[thread.id])
+            if (missing.length) {
+              throw new Error(`PR #${number} needs review evidence for ${missing.map(thread => thread.id).join(', ')}. Use orchestrator_review_checklist and verify the requested code and tests for each thread.`)
             }
             const after = await readPull(host.github, number, signal)
             if (after.head.sha !== before.head.sha) {
@@ -115,7 +142,11 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         return host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
           if (refused) throw new Error(refused)
-          const report = { state: args.state, summary: args.summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
+          const evidence = args.state === 'ready' && Object.entries(args.review_evidence ?? {})
+          const summary = evidence && evidence.length
+            ? [args.summary, 'Review evidence:', ...evidence.map(([id, detail]) => `${id}: ${detail}`)].join('\n')
+            : args.summary
+          const report = { state: args.state, summary, ...(args.human_action !== undefined ? { question: args.human_action } : {}),
             ...(args.question_for_trigger_id ? { askedBy: args.question_for_trigger_id } : {}),
             ...(args.reply_to_trigger_id ? { answers: args.reply_to_trigger_id } : {}) }
           const updated = host.engine.report(ticketId, report)
