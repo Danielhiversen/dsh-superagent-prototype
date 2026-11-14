@@ -145,7 +145,7 @@ export class Assignments extends EnginePart {
     if (retryReview && state === 'progress') {
       this.options.executor.stop(ticket, assignment, 'reviewRetry')
       this.tickets.restart(ticket, assignment, 'reviewRetry',
-        `Continue the open PR review. Previous report: ${(rejected ?? report.summary).slice(0, 1500)}. Inspect the current worktree and remote PR, finish remaining fixes, test, push and verify the remote head, then resolve the addressed review threads and verify their status. Report blocked with a concrete human action if you cannot proceed.`)
+        `Continue the unfinished assignment. Previous report: ${(rejected ?? report.summary).slice(0, 1500)}. Inspect the current worktree and remote PR, finish remaining fixes, test, push and verify the remote head, open the ticket PR if required, then resolve any addressed review threads and verify their status. Report blocked with a concrete human action if you cannot proceed.`)
       return this.require(ticketId)
     }
     // A ticket that follows Threads ends with them: a ready report ends it only once followsDone holds, with that outcome.

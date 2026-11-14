@@ -101,6 +101,8 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
         question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
         pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
+        no_repository_changes: z.literal(true).optional()
+          .describe('For ready without a PR, attest that the assignment produced no repository changes, local or pushed.'),
         verified_head_sha: z.string().regex(/^[0-9a-f]{40}$/).optional()
           .describe('For ready with one open PR, the full SHA of the pushed commit you verified.'),
         verified_heads: z.record(z.string().regex(/^[1-9][0-9]*$/), z.string().regex(/^[0-9a-f]{40}$/)).optional()
@@ -124,9 +126,11 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         if (args.state === 'ready') {
           const numbers = pullNumbers(current)
           if (pull?.state === 'open') numbers.add(pull.number)
+          let hasOpenPull = false
           for (const number of numbers) {
             const before = pull?.number === number ? pull : await readPull(host.github, number, signal)
             if (before.state !== 'open') continue
+            hasOpenPull = true
             const claimed = args.verified_heads?.[String(number)] ?? (numbers.size === 1 ? args.verified_head_sha : undefined)
             if (claimed !== before.head.sha) {
               rejectReady(`PR #${number} head is ${before.head.sha}. Push your intended changes, verify that revision and its checks, and report its exact SHA in verified_head_sha or verified_heads.`)
@@ -144,6 +148,9 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
             if (after.head.sha !== before.head.sha) {
               rejectReady(`PR #${number} changed during verification. Check the current head and review threads again before reporting ready.`)
             }
+          }
+          if (!hasOpenPull && !args.no_repository_changes) {
+            rejectReady('Open a pull request for the repository changes and report its number and verified head SHA. A pushed branch alone is incomplete. Use no_repository_changes only for work that produced no repository changes.')
           }
         }
         // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.

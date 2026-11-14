@@ -136,7 +136,7 @@ async function acceptedTicket(trigger = feishu('1', '@bot 修一下回归')) {
 }
 beforeEach(async () => {
   directory = mkdtempSync(join(tmpdir(), 'orchestrator-runtime-'))
-  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
+  vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1] === 'graphql' ? { data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } } : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'a'.repeat(40), repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
   vi.spyOn(Commands.prototype, 'git').mockResolvedValue('')
   vi.spyOn(Commands.prototype, 'run').mockResolvedValue('{"ok":true,"data":{}}')
@@ -332,7 +332,7 @@ it('records worker reports, binds the task PR, ends the ticket on ready without 
   expect(pullOf(bound)).toBe(42)
   expect(bound.attention).toBeUndefined()
   expect(runtime.store.threads.get('github:42')?.subscriptions).toEqual([ticket.id])
-  await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'reviewed' })
+  await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'reviewed', verified_head_sha: 'a'.repeat(40) })
   expect(runtime.store.tickets.get(ticket.id)!.ended).toBeUndefined()
   expect(relays(runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', state: 'ready' })
   expect(await runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text: '已提交 PR #42，待 review。' })).toEqual({ status: 'sent' })
@@ -369,9 +369,18 @@ it('shows a message that carries JSON, with or without a label, as its label and
   expect(readable('label: {not json}')).toBe('label: {not json}')
 })
 
+it('keeps implementation work open when the worker pushed a branch without opening a PR', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  await expect(runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Branch pushed' }))
+    .rejects.toThrow('Open a pull request')
+  const updated = runtime.store.tickets.get(ticket.id)!
+  expect(updated.ended).toBeUndefined()
+  expect(updated.assignments.at(-1)?.readyRejection).toContain('Open a pull request')
+})
+
 it('ends a ticket on ready when no PR is bound', async () => {
   const { ticket, sessionId } = await acceptedTicket()
-  await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'done locally' })
+  await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Answered the question', no_repository_changes: true })
   expect(runtime.store.tickets.get(ticket.id)).toMatchObject({ ended: expect.objectContaining({ outcome: 'completed' }) })
   await expect(runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'late' })).rejects.toThrow('Ticket ended')
 })
@@ -1358,7 +1367,7 @@ it('tells the main Session of each requeue of the same Trigger', async () => {
 it('keeps replies and acknowledgements to an IM conversation within the IM limit', async () => {
   const { ticket, trigger, sessionId } = await acceptedTicket()
   const long = Array.from({ length: IM_WORDS + 1 }, () => 'word').join(' ')
-  await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'reviewed' })
+  await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'reviewed', no_repository_changes: true })
   await expect(runTool(runtime.masterId, 'orchestrator_reply', { ticket_id: ticket.id, purpose: 'result', text: long })).rejects.toThrow(`maximum is ${IM_WORDS}`)
   const follow = feishu('3', '还有一个问题', { mentions: [], root_id: trigger.meta.messageId as string, sender_id: MEMBER })
   await receive(follow)
@@ -1433,7 +1442,7 @@ it('tells the conversation that the PR merged when work a restart recovered ends
   const id = key('pr-terminal', '42', 'feishu', JSON.stringify({ chatId: CHAT, messageId: 'om_1' }), 'merged')
   expect(runtime.store.replyStatus(id)).toBeUndefined()
   // Its ready report ends the ticket with the PR, and the conversation hears of the merge once.
-  await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Recovered and verified' })
+  await runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Recovered and verified', no_repository_changes: true })
   expect(runtime.store.tickets.get(ticket.id)!.ended).toMatchObject({ outcome: 'merged' })
   expect(runtime.store.replyStatus(id)).toBeDefined()
   // The report that ended the ticket was the worker's own: its turn is not cancelled inside that tool call.
