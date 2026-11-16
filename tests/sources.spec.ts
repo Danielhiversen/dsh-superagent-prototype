@@ -13,6 +13,7 @@ import { pollThreads as pollGithubThreads } from '../src/sources/github.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { cursorAt, POLL_HORIZON_MS } from '../src/sources/poll.ts'
 import { Store } from '../src/app/store.ts'
+import { ticketExecution } from '../src/executor/dsh.ts'
 import { Commands, commandError } from '../src/infra/commands.ts'
 import { HealthBoard } from '../src/infra/health.ts'
 import { testDeployment } from './fixtures/deployment.ts'
@@ -24,7 +25,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 const MEMBER = 'ou_alice'
-function host(overrides: Partial<SourceContextDeps> = {}) {
+function host(overrides: Partial<SourceContextDeps> = {}, prepareTicket?: ConstructorParameters<typeof Engine>[0]['prepareTicket']) {
   const store = new Store(join(mkdtempSync(join(tmpdir(), 'sources-')), 'db.sqlite'))
   const settings = SettingsSchema.parse({ policy: { sources: { feishu: { allowed: [{ id: 'ou_alice', name: 'Alice' }], syncChat: 'oc_team' }, github: { allowed: [{ id: 'alice' }] } } }, eval: { mode: 'auto' }, sources: { feishu: { enabled: true, config: { chats: [{ chatId: 'oc_team', listen: 'mentions' }, { chatId: 'oc_observed', listen: 'all' }], directMessages: true } } } })
   store.saveSettings(settings)
@@ -35,7 +36,8 @@ function host(overrides: Partial<SourceContextDeps> = {}) {
   const assessor: Assessor = { request: vi.fn(async () => {}) }
   const executor: Executor = { start: vi.fn(async () => {}), deliver: vi.fn(async () => {}), stop: vi.fn(async () => {}) }
   const outbox = { send: () => {}, status: () => undefined, withdraw: () => {} }
-  const engine = new Engine({ repo: store, scope: sources, policy: () => settingsPolicy(store.settings(), sources), assessor, executor, outbox })
+  const engine = new Engine({ repo: store, scope: sources, policy: () => settingsPolicy(store.settings(), sources), assessor, executor, outbox,
+    ...prepareTicket ? { prepareTicket } : {} })
   const commands = new Commands(() => deployment, {}, new AbortController().signal)
   const receive = vi.fn(async (trigger: Trigger) => { const result = engine.receive(trigger); engine.evaluateDue(); return result })
   // Record outbound messages in the store without sending them.
@@ -871,7 +873,8 @@ describe('github source', () => {
     const timestamp = new Date(Date.now() + 1000).toISOString()
     const comment = { id: 5, body: 'Please fix the regression', user: { login: 'alice', type: 'User' }, updated_at: timestamp }
     const routes: Record<string, unknown> = { notifications: [], pulls: [own, openPull(13)],
-      'pulls/12': own, 'pulls/13': openPull(13), 'issues/12/comments': [comment, { ...comment, id: 9, user: own.user }],
+      'pulls/12': own, 'pulls/13': openPull(13), 'issues/12': issue(12, { pull_request: { url: own.html_url } }),
+      'issues/12/comments': [comment, { ...comment, id: 9, user: own.user }],
       'pulls/12/comments': [{ ...comment, id: 6 }],
       'pulls/12/reviews': [{ id: 7, user: comment.user, submitted_at: timestamp, state: 'CHANGES_REQUESTED' },
         { id: 8, user: comment.user, updated_at: timestamp, state: 'PENDING', body: 'Draft' }],
@@ -879,8 +882,28 @@ describe('github source', () => {
     github(h, routes)
     await pollRound(h)
     const triggers = h.receive.mock.calls.map(([trigger]) => trigger)
-    expect(triggers.map(trigger => [trigger.meta.number, trigger.meta.commentId])).toEqual([[12, 5], [12, 6], [12, 7]])
+    expect(triggers.every(trigger => trigger.meta.number === 12)).toBe(true)
+    expect([...new Set(triggers.map(trigger => trigger.meta.commentId))]).toEqual([5, 6, 7])
     expect(h.engine.candidate(triggers[0]!.id)?.strength).toBe('explicit')
+    h.store.close()
+  })
+  it('starts a worker for trusted PR review feedback without an assessor decision', async () => {
+    const h = host({}, (ticket, outcome) => ({ ...ticket, execution: ticketExecution(ticket, outcome, SettingsSchema.parse({}), tmpdir()) }))
+    const settings = h.store.settings()
+    h.store.saveSettings({ ...settings, sources: { github: { enabled: true, config: { addressOwnPullReviews: true } } } })
+    const own = agentsPull(12, 'fix')
+    const timestamp = new Date(Date.now() + 1000).toISOString()
+    const feedback = { id: 7, body: 'Please fix the regression', user: { login: 'alice', type: 'User' },
+      submitted_at: timestamp, state: 'CHANGES_REQUESTED' }
+    github(h, { notifications: [], pulls: [own], 'pulls/12': own,
+      'issues/12': issue(12, { pull_request: { url: own.html_url } }), 'pulls/12/reviews': [feedback] })
+    await pollRound(h)
+    expect(h.executor.start).toHaveBeenCalledOnce()
+    expect(h.store.decisions.byThread('github:12')).toEqual([expect.objectContaining({
+      kind: 'accept', mandate: expect.objectContaining({ basis: expect.objectContaining({ via: 'trustedReview' }) }),
+    })])
+    await pollRound(h)
+    expect(h.executor.start).toHaveBeenCalledOnce()
     h.store.close()
   })
   it('reads a PR mention posted before the checkpoint when its notification arrives late', async () => {
