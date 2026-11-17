@@ -74,7 +74,7 @@ export interface ReviewVerdict {
   decision: 'approved' | 'changes_requested'
   summary: string
 }
-export type ReviewSnapshot = { parent: string; mergeParent?: string; automaticMergeTree?: string; tree: string; patch: string; headPatch?: string; fileContext: Record<string, string> }
+export type ReviewSnapshot = { parent: string; mergeParent?: string; automaticMergeTree?: string; patchBase?: string; tree: string; patch: string; headPatch?: string; fileContext: Record<string, string> }
 
 function receipt(parent: string, tree: string, mergeParent?: string): string {
   if ((parent !== 'root' && !objectId.test(parent)) || !objectId.test(tree)) {
@@ -117,10 +117,11 @@ export async function reviewStaged(
         throw error
       })).split('\n', 1)[0]!
     : ''
-  const base = objectId.test(automaticMergeTree) ? automaticMergeTree : before.parent === 'root'
+  const base = mergeConflict && before.mergeParent ? before.mergeParent
+    : objectId.test(automaticMergeTree) ? automaticMergeTree : before.parent === 'root'
     ? await git(directory, ['hash-object', '-w', '-t', 'tree', '/dev/null'], signal) : before.parent
   const diff = ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=none']
-  await git(directory, [...diff, '--check', base, before.tree, '--'], signal)
+  await git(directory, [...diff, '--check', automaticMergeTree || base, before.tree, '--'], signal)
   const patch = await git(directory, [...diff, '--binary', '--full-index', '--unified=12', base, before.tree, '--'], signal)
     .catch((error: unknown) => {
       if ((error as { code?: string }).code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
@@ -143,9 +144,8 @@ export async function reviewStaged(
   const fileContext = Object.fromEntries(entries.filter(entry => entry !== undefined))
   const headPatch = before.parent === 'root' ? '' : await gitOptional(directory,
     ['show', '--format=', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=3', before.parent, '--'], signal)
-  // Keep the complete conflict-resolution diff, with its baseline explicitly identified.
   const verdict = await reviewer({ parent: before.parent, ...before.mergeParent ? { mergeParent: before.mergeParent } : {},
-    ...automaticMergeTree ? { automaticMergeTree } : {}, tree: before.tree, patch, ...headPatch ? { headPatch: headPatch.slice(0, 24_000) } : {}, fileContext }, signal)
+    ...automaticMergeTree ? { automaticMergeTree, patchBase: base } : {}, tree: before.tree, patch, ...headPatch ? { headPatch: headPatch.slice(0, 24_000) } : {}, fileContext }, signal)
   signal.throwIfAborted()
   const after = await stagedIdentity(directory, signal)
   if (before.tree !== after.tree || before.parent !== after.parent || before.mergeParent !== after.mergeParent) {

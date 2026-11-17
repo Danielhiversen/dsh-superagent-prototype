@@ -19,7 +19,7 @@ const Verdict = z.object({
 const INSTRUCTIONS = [
   'You are an independent, read-only code reviewer. The implementation worker is a separate agent.',
   'Review the complete unified Git diff against the ticket scope and recent human follow-ups. Hunk boundaries omit unchanged lines.',
-  'When automaticMergeTree is present, the diff shows the edits and conflict resolutions relative to the automatic merge of the two listed parents. Lines prefixed with minus, including conflict markers, belong only to the baseline. Check fileContext before reporting a missing implementation or conflict marker.',
+  'For a merge, patchBase is the tree or commit used as the left side of the diff. Lines prefixed with minus belong only to that baseline. Use staged fileContext to verify any claim about the result.',
   'Identify concrete defects or regressions. Use the follow-ups to understand intended behavior.',
   'fileContext contains bounded staged file content with omitted sections marked. patch is the full staged diff. Evaluate the resulting tree using added and unchanged lines.',
   'Use unchanged staged lines as evidence of behavior already present. A staged follow-up such as a lint fix may be incremental. Review the effects of the staged diff and distinguish existing incompleteness from a defect introduced or left by the proposed change.',
@@ -76,7 +76,7 @@ export async function reviewWithModel(ctx: Context, settings: Settings, ticket: 
         tools: [VERDICT_TOOL],
         messages: [{ role: 'user', content: [{ type: 'text', text: JSON.stringify({
           title: ticket.title, scope: ticket.mandate.scope, request, followUps, parent: snapshot.parent, mergeParent: snapshot.mergeParent,
-          tree: snapshot.tree, automaticMergeTree: snapshot.automaticMergeTree, patch: snapshot.patch, fileContext: snapshot.fileContext,
+          tree: snapshot.tree, automaticMergeTree: snapshot.automaticMergeTree, patchBase: snapshot.patchBase, patch: snapshot.patch, fileContext: snapshot.fileContext,
         }) }] }],
         signal: routeSignal,
       })) {
