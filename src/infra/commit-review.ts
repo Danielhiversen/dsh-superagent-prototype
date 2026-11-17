@@ -104,10 +104,14 @@ export async function reviewStaged(
   if (expected && (before.parent !== expected.parent || before.mergeParent !== expected.mergeParent || before.tree !== expected.tree)) {
     return { decision: 'stale', summary: 'The commit differs from the staged index. Stage the intended changes, then retry git commit.' }
   }
-  // A successful three-way merge reconstructs inherited content from both immutable parents.
-  // Conflicts retain the full first-parent review so every resolution remains visible.
+  // Git's merge tree includes conflict markers so the diff shows each staged resolution.
   const automaticMergeTree = before.mergeParent
-    ? await gitOptional(directory, ['merge-tree', '--write-tree', before.parent, before.mergeParent], signal)
+    ? (await gitRaw(directory, ['merge-tree', '--write-tree', before.parent, before.mergeParent], signal)
+      .catch((error: unknown) => {
+        const failure = error as { code?: number; stdout?: string }
+        if (failure.code === 1 && typeof failure.stdout === 'string') return failure.stdout
+        throw error
+      })).split('\n', 1)[0]!
     : ''
   const base = objectId.test(automaticMergeTree) ? automaticMergeTree : before.parent === 'root'
     ? await git(directory, ['hash-object', '-w', '-t', 'tree', '/dev/null'], signal) : before.parent

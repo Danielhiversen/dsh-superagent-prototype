@@ -130,7 +130,7 @@ it.each(['rate-limited', 'inconclusive'])('uses the configured fallback when the
   }
 })
 
-it('requires a separate approval for a two-parent integration commit', async () => {
+it.each([false, true])('requires a separate approval for a two-parent integration commit (conflict=%s)', async conflict => {
   const cwd = await mkdtemp(join(tmpdir(), 'reviewed-merge-'))
   try {
     const repo = join(cwd, 'repo')
@@ -147,19 +147,37 @@ it('requires a separate approval for a two-parent integration commit', async () 
     await git('config', 'user.email', 'worker@example.com')
     await git('commit', '--allow-empty', '-m', 'base')
     await git('branch', 'existing-pr')
+    if (conflict) await writeFile(join(repo, 'shared.txt'), 'main choice\n')
     await writeFile(join(repo, 'upstream.txt'), 'current upstream\n'.repeat(15000))
-    await git('add', 'upstream.txt')
+    await git('add', '.')
     await git('commit', '-m', 'Advance main')
     await git('push', 'origin', 'main')
     await git('switch', 'existing-pr')
+    if (conflict) {
+      await writeFile(join(repo, 'shared.txt'), 'feature choice\n')
+      await git('add', 'shared.txt')
+      await git('commit', '-m', 'Feature change')
+      await git('push', 'origin', 'existing-pr')
+    }
     await git('config', 'core.hooksPath', reviewHooks(stateDir))
     await enableCommitReview(repo, reviewHooks(stateDir))
-    await git('merge', '--no-ff', '--no-commit', 'main')
+    const merge = git('merge', '--no-ff', '--no-commit', 'main')
+    if (conflict) {
+      await expect(merge).rejects.toMatchObject({ stdout: expect.stringContaining('CONFLICT') })
+      await writeFile(join(repo, 'shared.txt'), 'resolved choice\n')
+      await git('add', 'shared.txt')
+    } else await merge
     const signal = new AbortController().signal
     await expect(git('commit', '-m', 'Unreviewed merge')).rejects.toThrow('orchestrator_review_staged')
     const approved = await reviewStaged(repo, async snapshot => {
-      expect(snapshot.automaticMergeTree).toBe(snapshot.tree)
-      expect(snapshot.patch).toBe('')
+      if (conflict) {
+        expect(snapshot.automaticMergeTree).toMatch(/^[0-9a-f]{40}$/)
+        expect(snapshot.patch).toContain('+resolved choice')
+        expect(snapshot.patch).not.toContain('upstream.txt')
+      } else {
+        expect(snapshot.automaticMergeTree).toBe(snapshot.tree)
+        expect(snapshot.patch).toBe('')
+      }
       return { decision: 'approved', summary: 'Reviewed integration tree' }
     }, signal)
     expect(approved.decision).toBe('approved')
