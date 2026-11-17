@@ -105,11 +105,15 @@ export async function reviewStaged(
     return { decision: 'stale', summary: 'The commit differs from the staged index. Stage the intended changes, then retry git commit.' }
   }
   // Git's merge tree includes conflict markers so the diff shows each staged resolution.
+  let mergeConflict = false
   const automaticMergeTree = before.mergeParent
     ? (await gitRaw(directory, ['merge-tree', '--write-tree', before.parent, before.mergeParent], signal)
       .catch((error: unknown) => {
         const failure = error as { code?: number; stdout?: string }
-        if (failure.code === 1 && typeof failure.stdout === 'string') return failure.stdout
+        if (failure.code === 1 && typeof failure.stdout === 'string') {
+          mergeConflict = true
+          return failure.stdout
+        }
         throw error
       })).split('\n', 1)[0]!
     : ''
@@ -132,13 +136,14 @@ export async function reviewStaged(
     if (!size || Number(size) > 64_000) return undefined
     const contents = await gitRaw(directory, ['cat-file', 'blob', blob], signal)
     if (!contents || contents.includes('\0')) return undefined
-    const context = contents.length <= 6400 ? contents
+    const context = contents.length <= (mergeConflict ? 32000 : 6400) ? contents
       : contents.slice(0, 2400) + '\n[Middle of staged file omitted]\n' + contents.slice(-4000)
     return [path, context] as const
   }))
   const fileContext = Object.fromEntries(entries.filter(entry => entry !== undefined))
   const headPatch = before.parent === 'root' ? '' : await gitOptional(directory,
     ['show', '--format=', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=3', before.parent, '--'], signal)
+  // Keep the complete conflict-resolution diff, with its baseline explicitly identified.
   const verdict = await reviewer({ parent: before.parent, ...before.mergeParent ? { mergeParent: before.mergeParent } : {},
     ...automaticMergeTree ? { automaticMergeTree } : {}, tree: before.tree, patch, ...headPatch ? { headPatch: headPatch.slice(0, 24_000) } : {}, fileContext }, signal)
   signal.throwIfAborted()
