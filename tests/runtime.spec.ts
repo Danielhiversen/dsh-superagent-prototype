@@ -469,7 +469,9 @@ it('resolves only selected review threads after checking the pushed head and the
   await expect(resolve('a', ['fixed', 'foreign'])).rejects.toThrow('foreign')
   await expect(resolve('a', ['fixed'], 41)).rejects.toThrow('does not belong')
   expect([...resolved]).toEqual(['already'])
-  await expect(resolve('a', ['fixed', 'already'])).resolves.toMatchObject({ pending: ['fixed'] })
+  await expect(runTool(sessionId, 'orchestrator_report', {
+    state: 'ready', summary: 'Verified the fixed thread', verified_head_sha: 'a'.repeat(40), review_evidence: evidence,
+  })).rejects.toThrow('unresolved review threads')
   await runtime.idle()
   expect([...resolved]).toEqual(['already'])
   const runDue = async () => {

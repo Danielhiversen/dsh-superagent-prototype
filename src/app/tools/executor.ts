@@ -338,7 +338,34 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
               }
             }
             const checklist = await readReviewThreads(host.github, number, signal)
+            const fresh = await readPull(host.github, number, signal)
+            if (fresh.state !== 'open' || fresh.head.sha !== before.head.sha) {
+              rejectReady('The PR changed during verification of its review threads. Check its current head.')
+            }
             const threads = checklist.filter(thread => !thread.resolved)
+            const evidence = Object.fromEntries(threads.flatMap(thread => {
+              const detail = args.review_evidence?.[thread.id]
+              return detail ? [[thread.id, detail]] : []
+            }))
+            const addressed = Object.keys(evidence)
+            if (addressed.length) {
+              const error = pullClaimError(host.github, ticketId, fresh)
+              if (error) rejectReady(error)
+              host.store.atomic(() => {
+                if (host.store.tickets.get(ticketId)?.assignments.at(-1)?.id !== assignmentId) {
+                  throw new Error('Assignment changed while queueing review replies')
+                }
+                const effectKey = reviewResolutionKey(ticketId, number)
+                const earlier = host.effects.queued('reviewResolution', effectKey)
+                const previous = earlier?.head === fresh.head.sha ? earlier : undefined
+                host.effects.enqueue('reviewResolution', effectKey, {
+                  ticketId, pr: number, head: fresh.head.sha,
+                  threads: [...new Set([...(previous?.threads ?? []), ...addressed])],
+                  requiredChecks: [...new Set([...(previous?.requiredChecks ?? []), ...(managedReview ? [REQUIRED_CIRCLECI] : [])])],
+                  evidence: { ...previous?.evidence, ...evidence },
+                })
+              })
+            }
             if (threads.length) {
               rejectReady(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, pass per-thread review_evidence to orchestrator_resolve_review_threads for addressed threads, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
             }
