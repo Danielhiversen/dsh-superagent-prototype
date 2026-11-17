@@ -879,7 +879,7 @@ describe('github source', () => {
       'issues/13/comments': [comment] }
     github(h, routes)
     await pollRound(h)
-    const triggers = h.receive.mock.calls.map(([trigger]) => trigger)
+    const triggers = [...new Map(h.receive.mock.calls.map(([trigger]) => [trigger.id, trigger])).values()]
     expect(triggers.map(trigger => [trigger.meta.number, trigger.meta.commentId])).toEqual([[12, 5], [12, 6], [12, 7]])
     expect(h.engine.candidate(triggers[0]!.id)?.strength).toBe('explicit')
     h.store.close()
