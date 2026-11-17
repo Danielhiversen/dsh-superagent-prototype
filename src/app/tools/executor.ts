@@ -2,7 +2,14 @@
 import { z } from 'zod'
 import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
-import { claimPull, pullClaimError, pullsOf, readPull, readReviewThreads, resolveReviewThread, type Pull } from '../../sources/github-pull.ts'
+import { agentPull, claimPull, pullClaimError, pullsOf, readPull, readReviewThreads, resolveReviewThread, type Pull } from '../../sources/github-pull.ts'
+import { reviewHooks, reviewStaged, reviewedCommit, workspaceOwnsGit } from '../../infra/commit-review.ts'
+import { agentVariables, runAsWorker, verifyDirectory } from '../../infra/environment.ts'
+import { reviewWithModel } from '../commit-review.ts'
+import type { Context } from '@deepseek-ai/cordis'
+import { ciFailures, pullChecks, REQUIRED_CIRCLECI } from '../../sources/github-read.ts'
+import { commitReviewCiKey, reviewedCircleCiPassed, replyToVerifiedReview, reviewChecksPassed, reviewResolutionKey } from '../review-resolution.ts'
+import type { Effects } from '../effects.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
@@ -10,13 +17,17 @@ import { reportRelay, threadFollowedNotice } from '../notices.ts'
 import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 
+const ReviewEvidenceSchema = z.record(z.string(), z.string().trim().min(1).max(640))
+
 export interface ExecutorToolsHost {
+  readonly context: Context
   readonly engine: Pick<EngineForExecutor, 'report' | 'validateReport' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
-  readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic'>
+  readonly store: Pick<Store, 'tickets' | 'replyStatus' | 'atomic' | 'settings' | 'triggers'>
   readonly sessions: Pick<Sessions, 'relay' | 'notify'>
   readonly resources: ResourceHost
   /** GitHub Source context whose pull-request rules govern claiming a reported PR. */
   readonly github: SourceContext
+  readonly effects: Pick<Effects, 'enqueue' | 'queued'>
   sendReplies(): Promise<void>
 }
 
@@ -34,8 +45,110 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
     tool({
+      name: 'orchestrator_review_staged',
+      description: 'Review staged changes. Fix findings and repeat until approved.',
+      schema: z.object({}).strict(),
+      execute: async (_args, signal) => {
+        const current = host.store.tickets.get(ticketId)
+        if (!current || !liveTicket(current) || !current.execution?.directory) {
+          throw new Error('Ticket has no open managed Git workspace')
+        }
+        return reviewStaged(current.execution.directory,
+          (snapshot, deadline) => reviewWithModel(host.context, host.store.settings(), current, snapshot, deadline, id => host.store.triggers.get(id)), signal)
+      },
+    }),
+    tool({
+      name: 'orchestrator_publish_review',
+      description: 'Publish the reviewed local HEAD to its existing PR. Pass evidence by thread ID to reply and resolve automatically after CircleCI.',
+      schema: z.object({
+        pr_number: z.number().int().positive(),
+        local_head_sha: z.string().regex(/^[0-9a-f]{40}$/),
+        review_evidence: ReviewEvidenceSchema.optional(),
+      }).strict(),
+      execute: async ({ pr_number, local_head_sha, review_evidence }, signal) => {
+        const current = host.store.tickets.get(ticketId)
+        if (!current || !liveTicket(current) || !pullNumbers(current).has(pr_number)) {
+          throw new Error('PR does not belong to this open ticket')
+        }
+        const source = host.github
+        const assignmentId = current.assignments.at(-1)?.id
+        const verify = (pr: Pull) => {
+          const latest = host.store.tickets.get(ticketId)
+          if (!latest || !liveTicket(latest) || latest.assignments.at(-1)?.id !== assignmentId) {
+            throw new Error('Assignment changed while publishing the reviewed commit')
+          }
+          const error = pullClaimError(source, ticketId, pr)
+          if (error) throw new Error(error)
+          if (pr.state !== 'open' || !agentPull(pr, source.deployment)) throw new Error('Expected an open agent-authored PR in the configured repository')
+        }
+        const before = await readPull(source, pr_number, signal)
+        verify(before)
+        const evidenceIds = Object.keys(review_evidence ?? {})
+        if (evidenceIds.length > 100) throw new Error('Provide evidence for at most 100 review threads')
+        const checklist = evidenceIds.length ? await readReviewThreads(source, pr_number, signal) : []
+        const unknown = evidenceIds.filter(id => !checklist.some(thread => thread.id === id))
+        if (unknown.length) throw new Error(`Threads do not belong to PR #${pr_number}: ${unknown.join(', ')}`)
+        const open = checklist.filter(thread => !thread.resolved && evidenceIds.includes(thread.id)).map(thread => thread.id)
+        const pushed = before.head.sha !== local_head_sha
+        const directory = current.execution?.directory ?? ''
+        if (pushed && before.auto_merge != null) throw new Error('Withdraw auto-merge before publishing changes')
+        if (open.length && !pushed && !await reviewedCommit(directory, local_head_sha, signal)) {
+          throw new Error('The published head lacks independent staged review')
+        }
+        if (pushed) {
+          if (!await workspaceOwnsGit(directory, signal)) throw new Error('Ticket has no open managed Git workspace')
+          const { repository, stateDir } = source.deployment
+          const env = Object.fromEntries(Object.entries(agentVariables(stateDir)).filter((entry): entry is [string, string] => entry[1] !== undefined))
+          const deadline = AbortSignal.any([signal, AbortSignal.timeout(120_000)])
+          const git = (...args: string[]) => runAsWorker(host.context.subprocess,
+            ['git', '--no-replace-objects', '-c', `core.hooksPath=${reviewHooks(stateDir)}`, ...args], directory, deadline, env)
+            .then(value => value.trim())
+          await verifyDirectory(directory, host.context.subprocess, deadline)
+          if (await git('rev-parse', 'HEAD') !== local_head_sha) throw new Error('Provide the exact local head SHA')
+          const url = `https://github.com/${repository}.git`
+          const origin = await git('remote', 'get-url', 'origin')
+          const pushOrigin = await git('remote', 'get-url', '--push', '--all', 'origin')
+          if (origin !== url || pushOrigin !== url) throw new Error('The Git workspace origin must point to the configured GitHub repository')
+          const ref = `refs/heads/${before.head.ref}`
+          await git('check-ref-format', ref)
+          await git('fetch', '--no-tags', 'origin', ref)
+          if (await git('rev-parse', 'FETCH_HEAD') !== before.head.sha) throw new Error('The PR branch moved. Fetch and verify the current head.')
+          await git('merge-base', '--is-ancestor', before.head.sha, local_head_sha)
+          if (!await reviewedCommit(directory, local_head_sha, deadline, before.head.sha)) throw new Error('The local head lacks independent staged review')
+          const fresh = await readPull(source, pr_number, deadline)
+          verify(fresh)
+          if (fresh.head.ref !== before.head.ref || fresh.head.sha !== before.head.sha) throw new Error('The PR changed before the push')
+          await git('push', 'origin', `${local_head_sha}:${ref}`)
+        }
+        const after = await readPull(source, pr_number, signal)
+        verify(after)
+        if (after.head.ref !== before.head.ref || after.head.sha !== local_head_sha) throw new Error('GitHub did not confirm the requested commit as the PR head')
+        host.store.atomic(() => {
+          verify(after)
+          const refused = claimPull(source, ticketId, after)
+          if (refused) throw new Error(refused)
+          const key = commitReviewCiKey(ticketId)
+          if (host.effects.queued('commitReviewCi', key)?.head !== local_head_sha) {
+            host.effects.enqueue('commitReviewCi', key, { ticketId, pr: pr_number, head: local_head_sha })
+          }
+          if (open.length) {
+            const key = reviewResolutionKey(ticketId, pr_number)
+            const queued = host.effects.queued('reviewResolution', key)
+            const previous = queued?.head === local_head_sha ? queued : undefined
+            host.effects.enqueue('reviewResolution', key, {
+              ticketId, pr: pr_number, head: local_head_sha,
+              threads: [...new Set([...(previous?.threads ?? []), ...open])],
+              requiredChecks: [...new Set([...(previous?.requiredChecks ?? []), REQUIRED_CIRCLECI])],
+              evidence: { ...previous?.evidence, ...Object.fromEntries(open.map(id => [id, review_evidence![id]!])) },
+            })
+          }
+        })
+        return { head: local_head_sha, pushed, pr: pr_number, pending_threads: open }
+      },
+    }),
+    tool({
       name: 'orchestrator_review_checklist',
-      description: 'Read ticket PR review threads, including resolved ones. Use their IDs for resolution and ready evidence.',
+      description: 'Read PR review thread IDs, comments, and resolution status.',
       schema: z.object({ pr_number: z.number().int().positive(), offset: z.number().int().nonnegative().default(0) }).strict(),
       execute: async ({ pr_number, offset }, signal) => {
         const current = host.store.tickets.get(ticketId)
@@ -48,13 +161,16 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
     }),
     tool({
       name: 'orchestrator_resolve_review_threads',
-      description: 'Resolve addressed checklist threads at the verified pushed head.',
+      description: 'Post verification evidence in each selected review thread and resolve it once CI passes.',
       schema: z.object({
         pr_number: z.number().int().positive(),
         verified_head_sha: z.string().regex(/^[0-9a-f]{40}$/),
         thread_ids: z.array(z.string().min(1)).min(1).max(100),
+        review_evidence: ReviewEvidenceSchema.optional()
+          .describe('Files and checks by open thread ID.'),
+        required_check: z.string().trim().min(1).max(120).optional().describe('Required CI check name.'),
       }).strict(),
-      execute: async ({ pr_number, verified_head_sha, thread_ids }, signal) => {
+      execute: async ({ pr_number, verified_head_sha, thread_ids, review_evidence, required_check }, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current) || !pullNumbers(current).has(pr_number)) {
           throw new Error('PR does not belong to this open ticket')
@@ -77,8 +193,28 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         const ids = [...new Set(thread_ids)]
         const unknown = ids.filter(id => !checklist.has(id))
         if (unknown.length) throw new Error(`Threads do not belong to PR #${pr_number}: ${unknown.join(', ')}`)
-        for (const id of ids) {
-          if (checklist.get(id)?.resolved) continue
+        const open = ids.filter(id => !checklist.get(id)?.resolved)
+        const missing = open.filter(id => !review_evidence || !Object.hasOwn(review_evidence, id))
+        if (missing.length) throw new Error(`Provide review evidence for these open threads before resolving them: ${missing.join(', ')}`)
+        if (!open.length) return { resolved: ids }
+        const evidence = Object.fromEntries(open.map(id => [id, review_evidence![id]!]))
+        const effectKey = reviewResolutionKey(ticketId, pr_number)
+        const snapshot = await pullChecks(host.github.commands.withSignal(signal), verified_head_sha)
+        await verifyHead()
+        const queued = host.store.atomic(() => {
+          const earlier = host.effects.queued('reviewResolution', effectKey)
+          const previous = earlier?.head === verified_head_sha ? earlier : undefined
+          const requiredChecks = [...new Set([...(previous?.requiredChecks ?? []), ...(required_check ? [required_check] : [])])]
+          if (!previous && reviewChecksPassed(snapshot, requiredChecks)) return false
+          const threads = [...new Set([...(previous?.threads ?? []), ...open])]
+          host.effects.enqueue('reviewResolution', effectKey, { ticketId, pr: pr_number, head: verified_head_sha,
+            threads, requiredChecks, evidence: { ...previous?.evidence, ...evidence } })
+          return true
+        })
+        if (queued) return { pending: open, head: verified_head_sha }
+        for (const id of open) {
+          await verifyHead()
+          await replyToVerifiedReview(host.github, pr_number, verified_head_sha, checklist.get(id)!, evidence[id]!, signal)
           await verifyHead()
           await resolveReviewThread(host.github, id, signal)
         }
@@ -137,18 +273,18 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       schema: z.object({
         state: z.enum(['progress', 'ready', 'blocked', 'failed', 'dropped']),
         summary: z.string().min(1),
-        human_action: z.string().trim().min(1).max(1000).nullish().describe('One concrete question for a person, also with state=progress; omit to keep the pending one, null to clear it.'),
-        question_for_trigger_id: z.string().optional().describe('With human_action: the human message that raised the question, which is asked where that person wrote.'),
+        human_action: z.string().trim().min(1).max(1000).nullish().describe('Question for a person. Omit to keep it, null to clear it.'),
+        question_for_trigger_id: z.string().optional().describe('Trigger that raised the question.'),
         pr_number: z.number().int().positive().nullish().describe(`The ticket's PR: its source PR, or one by ${host.github.deployment.github.login} from a branch named after this ticket (DSH_SUPERAGENT_NAME).`),
         no_repository_changes: z.literal(true).optional()
-          .describe('For ready without a PR, attest to no local or pushed repository changes.'),
+          .describe('Ready without local or pushed changes.'),
         verified_head_sha: z.string().regex(/^[0-9a-f]{40}$/).optional()
-          .describe('For ready with one open PR, the full SHA of the pushed commit you verified.'),
+          .describe('Verified pushed SHA for one open PR.'),
         verified_heads: z.record(z.string().regex(/^[1-9][0-9]*$/), z.string().regex(/^[0-9a-f]{40}$/)).optional()
-          .describe('Verified SHAs by PR number when reporting ready for multiple PRs.'),
-        review_evidence: z.record(z.string(), z.string().trim().min(1).max(640)).optional()
-          .describe('For ready, map all review thread IDs to files and checks proving each fix at the verified head.'),
-        reply_to_trigger_id: z.string().optional().describe('The explicit human question this report answers; never for ordinary progress.'),
+          .describe('Verified pushed SHAs by PR number.'),
+        review_evidence: ReviewEvidenceSchema.optional()
+          .describe('For ready, files and checks by review thread ID.'),
+        reply_to_trigger_id: z.string().optional().describe('Human question this report answers.'),
       }).strict(),
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
@@ -177,18 +313,36 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
             const before = pull?.number === number ? pull : await readPull(host.github, number, signal)
             if (before.state === 'open') openPulls.push(before)
           }
+          const workspace = current.execution?.directory ?? ''
+          const managedReview = openPulls.length > 0 && (host.store.settings().executor.prepare.trim()
+            || await workspaceOwnsGit(workspace, signal))
           for (const before of openPulls) {
             const number = before.number
             const claimed = args.verified_heads?.[String(number)] ?? (openPulls.length === 1 ? args.verified_head_sha : undefined)
             if (claimed !== before.head.sha) {
               rejectReady(`PR #${number} head is ${before.head.sha}. Push your intended changes, verify that revision and its checks, and report its exact SHA in verified_head_sha or verified_heads.`)
             }
+            if (managedReview) {
+              if (!await reviewedCommit(workspace, before.head.sha, signal)) {
+                rejectReady('The PR head or its new commits lack an independent staged review. Review the staged changes before creating or replacing unreviewed commits.')
+              }
+              const checks = await pullChecks(host.github.commands.withSignal(signal), before.head.sha)
+              if (!reviewedCircleCiPassed(checks)) {
+                const failed = ciFailures(checks)
+                if (failed.length) rejectReady('CircleCI readiness blocked by failed checks: ' + failed.join(', '))
+                const key = commitReviewCiKey(ticketId)
+                if (host.effects.queued('commitReviewCi', key)?.head !== before.head.sha) {
+                  host.effects.enqueue('commitReviewCi', key, { ticketId, pr: number, head: before.head.sha })
+                }
+                rejectReady('CircleCI is pending on the reviewed PR head. The orchestrator will notify you when it changes.')
+              }
+            }
             const checklist = await readReviewThreads(host.github, number, signal)
             const threads = checklist.filter(thread => !thread.resolved)
             if (threads.length) {
-              rejectReady(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, resolve addressed threads with orchestrator_resolve_review_threads, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
+              rejectReady(`PR #${number} still has unresolved review threads. Check each against the pushed fixes, pass per-thread review_evidence to orchestrator_resolve_review_threads for addressed threads, and verify their status before reporting ready. Report a concrete blocker for anything outstanding. Open threads:\n${threads.map(thread => `${thread.id} ${thread.url}`).join('\n')}`)
             }
-            const missing = checklist.filter(thread => !args.review_evidence?.[thread.id])
+            const missing = checklist.filter(thread => !args.review_evidence || !Object.hasOwn(args.review_evidence, thread.id))
             if (missing.length) {
               rejectReady(`PR #${number} needs review evidence for ${missing.map(thread => thread.id).join(', ')}. Use orchestrator_review_checklist and verify the requested code and tests for each thread.`)
             }
@@ -217,7 +371,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
           const recorded = updated.assignments.at(-1)?.report
           const retrying = args.state === 'dropped' && !updated.ended && updated.assignments.at(-2)?.endedReason === 'reviewRetry'
             && !recorded
-          const relay = retrying ? undefined : reportRelay(updated, recorded ? { ...finalReport, state: recorded.state } : finalReport)
+          const relay = retrying ? undefined : reportRelay(updated, recorded ? { ...finalReport, state: recorded.state, summary: recorded.summary } : finalReport)
           if (relay) host.sessions.relay(relay.id, relay.text)
           const notification = relay ? 'orchestrator' : 'internal_only'
           return { reported: true, notification, ...retrying ? { retrying: true } : {}, ...(updated.attention ? { attention: updated.attention } : {}) }

@@ -76,3 +76,58 @@ it('checks out the requested PR head when continuing an existing pull request', 
   expect(prepare({ DSH_SUPERAGENT_GITHUB_PR_HEAD: 'refs/pull/15/head' }).status).toBe(0)
   expect(git(workspace, 'rev-parse', 'HEAD')).toBe(git(author, 'rev-parse', 'HEAD'))
 })
+
+it('rebases a resumed GitHub ticket and rejects a stale outgoing commit', async () => {
+  const { syncTicketBranch } = await import('../src/infra/environment.ts')
+  const { reviewPushHook } = await import('../src/infra/commit-review.ts')
+  expect(prepare().status).toBe(0)
+  const github = 'https://github.com/example/project.git'
+  git(workspace, 'remote', 'set-url', 'origin', github)
+  git(workspace, 'config', 'url.' + upstream + '.insteadOf', github)
+  writeFileSync(join(workspace, 'feature.txt'), 'feature\n')
+  git(workspace, 'add', '.')
+  git(workspace, 'commit', '-m', 'ticket work')
+  const stale = git(workspace, 'rev-parse', 'HEAD')
+  const base = git(author, 'rev-parse', 'HEAD')
+  writeFileSync(join(author, 'latest.txt'), 'new on main\n')
+  git(author, 'add', '.')
+  git(author, 'commit', '-m', 'advance main')
+  git(author, 'push', 'origin', 'main')
+
+  const review = join(workspace, '.git/superagent-review')
+  mkdirSync(review)
+  // Exempt the test's existing history to isolate the freshness check.
+  writeFileSync(join(review, 'baseline'), stale + '\n')
+  const push = (oid: string) => spawnSync('sh', ['-c', reviewPushHook, 'pre-push', 'origin', github], {
+    cwd: workspace, env, encoding: 'utf8',
+    input: 'refs/heads/dhh/test-ticket ' + oid + ' refs/heads/dhh/test-ticket ' + base + '\n',
+  })
+  const rejected = push(stale)
+  expect(rejected.status).not.toBe(0)
+  expect(rejected.stderr).toContain('behind GitHub main')
+
+  const continuing = spawnSync('sh', ['-c', syncTicketBranch], {
+    cwd: workspace, encoding: 'utf8',
+    env: { ...env, DSH_SUPERAGENT_GITHUB_REPOSITORY: 'example/project',
+      DSH_SUPERAGENT_GITHUB_ACCOUNT: 'agent', DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL: 'agent@example.com',
+      DSH_SUPERAGENT_GITHUB_PR_HEAD: 'refs/pull/15/head' },
+  })
+  expect(continuing.status, continuing.stderr).toBe(0)
+  expect(git(workspace, 'rev-parse', 'HEAD')).toBe(stale)
+
+  const synced = spawnSync('sh', ['-c', syncTicketBranch], {
+    cwd: workspace, encoding: 'utf8',
+    env: { ...env, DSH_SUPERAGENT_GITHUB_REPOSITORY: 'example/project',
+      DSH_SUPERAGENT_GITHUB_ACCOUNT: 'agent', DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL: 'agent@example.com' },
+  })
+  expect(synced.status, synced.stderr).toBe(0)
+  const rebased = git(workspace, 'rev-parse', 'HEAD')
+  expect(rebased).not.toBe(stale)
+  expect(git(workspace, 'rev-parse', 'HEAD^')).toBe(git(author, 'rev-parse', 'HEAD'))
+  expect(readFileSync(join(workspace, 'feature.txt'), 'utf8')).toBe('feature\n')
+  const parentTree = git(workspace, 'rev-parse', 'HEAD^^{tree}')
+  const tree = git(workspace, 'rev-parse', 'HEAD^{tree}')
+  writeFileSync(join(review, parentTree + '-' + tree + '.json'), '{}')
+  const accepted = push(rebased)
+  expect(accepted.status, accepted.stderr).toBe(0)
+})

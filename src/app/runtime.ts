@@ -16,24 +16,28 @@ import { lockSync } from 'proper-lockfile'
 import { Engine, key, reasonText, type EngineForSettings, type ReceiveResult, type Ticket, type Trigger } from '../core/index.ts'
 import { allowedSender, settingsPolicy } from '../policy.ts'
 import { SourceRegistry } from '../sources/registry.ts'
+import { enableCommitReview, reviewHooks } from '../infra/commit-review.ts'
 import { Commands } from '../infra/commands.ts'
 import type { Deployment, Machine } from '../deployment.ts'
 import { environmentOf, ticketEnvironment, type Variable } from './execution-environment.ts'
 import type { SetupProblem } from '../setup.ts'
 import { DshExecutor, sourceTrigger, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { ticketCard } from './cards.ts'
+import { startReviewSocket } from './commit-review.ts'
 import { MasterAssessor } from './assessment.ts'
 import { KV } from '../kv.ts'
 import { Store } from './store.ts'
 import { evalsHealth } from './views/overview.ts'
 import { TextCache } from './cache.ts'
-import { Effects } from './effects.ts'
+import { Effects, Later } from './effects.ts'
+import { resolveAfterChecks, reviewedCircleCiPassed } from './review-resolution.ts'
 import { Prompts } from './prompts.ts'
 import { registerHttp, type HttpHost } from './http.ts'
 import type { LinkTarget } from './views/records.ts'
 import { candidateCard, repliedTo, sourceLink, type LinkHost } from './links.ts'
 import { eventNotice, followupNotice } from './notices.ts'
-import { pullEndNotices } from '../sources/github-pull.ts'
+import { ciFailures, pullChecks } from '../sources/github-read.ts'
+import { pullClaimError, pullEndNotices, readPull } from '../sources/github-pull.ts'
 import { HealthBoard } from '../infra/health.ts'
 import { Outbox } from './outbox.ts'
 import { Passes } from './passes.ts'
@@ -160,9 +164,42 @@ export class Runtime extends Service implements SourceHost {
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
-        get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
+        get github() { return runtime.context({ kind: 'github', health: ['github'] }) }, effects,
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
+      effects.handle('reviewResolution', async (request, id) => {
+        const result = await resolveAfterChecks(this.toolHost.github, request, this.lifetime)
+        if (result === 'waiting') throw new Later('Waiting for checks on the verified PR head')
+        const ticket = store.tickets.get(request.ticketId)
+        if (!ticket || ticket.ended) return
+        const note = result === 'resolved'
+          ? `CI passed on PR #${request.pr} at ${request.head}. The queued review threads were resolved: ${request.threads.join(', ')}. Verify the final checklist and report the outcome.`
+          : `The queued review resolution for PR #${request.pr} was discarded because its head or ownership changed. Verify the current PR and submit fresh evidence if needed.`
+        await sessions.prompt(workerSessionId(ticket.id), `${id}:${request.head}:${result}`, note, 'steer')
+      }, { retry: [60_000, 300_000], limit: () => this.paused() ? 0 : 1 })
+      effects.handle('commitReviewCi', async (request, id) => {
+        const ctx = this.toolHost.github
+        const { ticketId, pr, head } = request
+        const signal = this.lifetime
+        const ticket = store.tickets.get(ticketId)
+        if (!ticket || ticket.ended) return
+        const before = await readPull(ctx, pr, signal)
+        if (before.state !== 'open' || pullClaimError(ctx, ticketId, before)) return
+        const checks = before.head.sha === head ? await pullChecks(ctx.commands.withSignal(signal), head) : undefined
+        const after = await readPull(ctx, pr, signal)
+        if (after.state !== 'open' || pullClaimError(ctx, ticketId, after)) return
+        const revision = 'PR #' + pr + ' at ' + head
+        let note: string
+        if (!checks || after.head.sha !== head) {
+          note = revision + ' changed while waiting for CircleCI. Verify the new head and its staged review before reporting ready.'
+        } else {
+          const failures = ciFailures(checks)
+          if (failures.length) note = 'Checks failed for ' + revision + ': ' + failures.join(', ') + '. Fix and restage for independent review before committing.'
+          else if (reviewedCircleCiPassed(checks)) note = 'CircleCI passed for ' + revision + '. Verify the current head and report ready if the remaining review requirements are met.'
+          else throw new Later('Waiting for required checks on the reviewed PR head')
+        }
+        await sessions.prompt(workerSessionId(ticketId), id + ':' + head + ':' + note, note, 'steer')
+      }, { retry: [60_000, 300_000], limit: () => this.paused() ? 0 : 1 })
       this.ready = this.initialize()
     } catch (error) {
       // Release the database and state lock if initialization fails so an in-process restart can reacquire them.
@@ -205,12 +242,19 @@ export class Runtime extends Service implements SourceHost {
       this.runtimeHealth.set({ ...health('paused', 'setupPending'), at: now() })
       return
     }
+    this.disposers.push(await startReviewSocket(this.machine.stateDir,
+      { context: this.ctx, settings: () => this.store.settings(), tickets: () => this.store.tickets.open(),
+        trigger: id => this.store.triggers.get(id), signal: this.lifetime }))
     this.sessions.install()
     this.executor.install()
     await this.sessions.ensure(this.masterId, this.machine.stateDir, 'dsh-superagent orchestrator', 'orchestrator')
     for (const id of this.settings.syncable()) await this.settings.sync(id).catch(() => { /* sync() records its failure in health. */ })
     // If stop() was called while awaiting setup, session creation, or policy sync, do not start background loops.
     if (this.closing()) return
+    for (const ticket of this.store.tickets.open()) {
+      await enableCommitReview(ticket.execution?.directory ?? '', reviewHooks(this.machine.stateDir), this.lifetime)
+        .catch((error: unknown) => this.ctx.logger.warn('Could not enable Git review for ticket %s: %s', ticket.id, String(error)))
+    }
     this.executor.resume()
     this.passes.start()
     this.effects.start()

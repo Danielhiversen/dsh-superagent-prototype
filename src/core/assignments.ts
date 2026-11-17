@@ -125,32 +125,67 @@ export class Assignments extends EnginePart {
     else delete ticket.attention
     // A replaced or cleared attention question withdraws any pending unsent reply for the previous question from the outbox.
     if (previous && previous.id !== attention?.id) this.replies.withdrawAttention(previous.id)
-    const review = (id: string) => {
+    const completed = ticket.assignments.findLast(item => item.reviewReadyAt || item.report?.state === 'ready')
+    const completedAt = completed?.reviewReadyAt ?? completed?.report?.at
+    const review = (id: string, origin: boolean) => {
       const trigger = this.repo.triggers.get(id)
-      return trigger?.source === 'github' && trigger.human && trigger.meta.isPr === true
-        && ['conversation', 'inline', 'review'].includes(String(trigger.meta.kind))
+      if (!trigger?.human || trigger.source !== 'github' || trigger.meta.isPr !== true) return false
+      const kind = trigger.meta.kind
+      const conversation = kind === 'conversation' && (origin || !!trigger.addressed || report.state === 'dropped')
+      if (kind !== 'review' && kind !== 'inline' && !conversation) return false
+      if (!origin && !this.owners(trigger).includes(ticketId)) return false
+      return trigger.threads.some(ref => {
+        if (ref.source !== 'github') return false
+        const follow = ticket.follows?.find(item => item.thread === `github:${ref.id}`)
+        return follow ? !follow.closed : origin
+      })
     }
-    const openPull = ticket.follows?.some(follow => follow.thread.startsWith('github:') && !follow.closed)
     if (report.readyRejected) assignment.readyRejection = report.summary
     if (['ready', 'blocked', 'failed'].includes(report.state) || attention) delete assignment.readyRejection
+    if (report.state === 'ready') assignment.reviewReadyAt = at
+
+    const preceding = ticket.assignments.at(-2)?.endedReason
+    const retryingReview = completed !== assignment
+      && (preceding === 'reviewRetry' || preceding === 'retried' || preceding === 'hostRestarted')
+    const unfinishedReview = () => (!completedAt && review(ticket.origin.triggerId, true))
+      || ticket.inputs.some(input => input.kind === 'trigger' && !input.context
+        && (input.deliveredTo === assignment.id || (retryingReview && !!input.deliveredTo))
+        && (!completedAt || (input.readAt ?? input.deliveredAt ?? input.at) > completedAt)
+        && review(input.triggerId, false))
     const rejected = report.state === 'waiting' && !attention ? assignment.readyRejection : undefined
-    const retryReview = rejected !== undefined || report.state === 'dropped' && !attention && openPull
-      && (review(ticket.origin.triggerId) || ticket.inputs.some(input => input.kind === 'trigger'
-        && input.deliveredTo === assignment.id && review(input.triggerId))
-        || ticket.assignments.at(-2)?.endedReason === 'reviewRetry')
-    const previousRetries = ticket.assignments.slice(0, -1).reverse().findIndex(item => item.endedReason !== 'reviewRetry')
-    const retries = previousRetries < 0 ? ticket.assignments.length - 1 : previousRetries
+    const retryReview = !attention && (report.state === 'waiting' || report.state === 'dropped')
+      && (rejected !== undefined || unfinishedReview())
+    let retries = 0
+    if (retryReview && completed !== assignment) {
+      for (const previous of ticket.assignments.slice(0, -1).reverse()) {
+        if (previous.endedReason !== 'reviewRetry') break
+        retries++
+        if (previous === completed) break
+      }
+    }
     const state = retryReview ? retries < 2 ? 'progress' : 'failed' : report.state
-    assignment.report = { state, summary: rejected ?? report.summary, at }
+    const unfinished = rejected ?? (report.summary.trim() || 'Worker ended without reporting a verified PR review result.')
+    const summary = retryReview && state === 'failed'
+      ? `PR review still unfinished after automatic recovery. Inspect the ticket worktree and PR, then retry the ticket. ${unfinished}`
+      : rejected ?? report.summary
+    assignment.report = { state, summary, at }
     ticket.updatedAt = at
     if (report.answers && !ticket.answers?.includes(report.answers)) ticket.answers = [...ticket.answers ?? [], report.answers]
     if (report.answers) this.takeUp(ticketId, report.answers)
     if (state === 'blocked' || state === 'failed') ticket.undelivered = ticket.undelivered.filter(id => !automatic(ticket.inputs.find(input => input.id === id)))
     this.repo.tickets.save(ticket)
+    if ((state === 'failed' || state === 'blocked') && !attention) {
+      const recent = ticket.inputs.slice().reverse().flatMap(input => input.kind === 'trigger' && input.human && !input.context
+        && (input.deliveredTo === assignment.id || (retryingReview && !!input.deliveredTo))
+        && (!completedAt || (input.readAt ?? input.deliveredAt ?? input.at) > completedAt) ? [input.triggerId] : [])
+      this.replies.notifyPullFollowupFailure(ticket, recent)
+    }
     if (retryReview && state === 'progress') {
       this.options.executor.stop(ticket, assignment, 'reviewRetry')
       this.tickets.restart(ticket, assignment, 'reviewRetry',
-        `Continue the unfinished assignment. Previous report: ${(rejected ?? report.summary).slice(0, 1500)}. Inspect the current worktree and remote PR, finish remaining fixes, test, push and verify the remote head, open the ticket PR if required, then resolve any addressed review threads and verify their status. Report blocked with a concrete human action if you cannot proceed.`)
+        ['Re-read the GitHub review and compare each finding with the current remote PR and local worktree. Inspect the diff and tests before deciding what still needs work.',
+          rejected ? `Last delivery verification failed: ${rejected.slice(0, 1500)}` : '',
+          'Commit independently reviewed changes and use orchestrator_publish_review with the exact local HEAD and evidence per thread. Confirm CI and replies before reporting ready. If blocked, report the failed step and exact error.'].filter(Boolean).join(' '))
       return this.require(ticketId)
     }
     // A ticket that follows Threads ends with them: a ready report ends it only once followsDone holds, with that outcome.

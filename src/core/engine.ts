@@ -34,7 +34,7 @@ export class Engine {
     this.tickets = new Tickets(options, this.replies)
     this.assignments = new Assignments(options, this.tickets, this.replies)
     this.evals = new Evals(options, this.tickets)
-    this.intake = new Intake(options, this.tickets)
+    this.intake = new Intake(options, this.tickets, this.replies)
   }
 
   // Sources
@@ -80,7 +80,10 @@ export class Engine {
       if (!liveTicket(ticket) && ticket.undelivered.length) this.repo.atomic(() => { this.tickets.wake(ticket.id) })
     }
     for (const thread of this.repo.threads.active()) {
-      if (thread.pending.length && !thread.evaluating) this.repo.atomic(() => { this.evals.start(thread.key, policy) })
+      if (thread.pending.length) this.repo.atomic(() => {
+        this.evals.routeReviews(thread, policy)
+        if (thread.pending.length && !thread.evaluating) this.evals.start(thread.key, policy)
+      })
     }
   }
 

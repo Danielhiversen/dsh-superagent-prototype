@@ -67,6 +67,38 @@ export class Evals extends EnginePart {
     this.repo.threads.save(thread)
     this.options.assessor.release?.(id)
   }
+  /** Send authorized PR review feedback to a worker without waiting for the assessor on this Thread. */
+  routeReviews(thread: Thread, policy: Policy): void {
+    const reviews: string[] = []
+    let primary: { trigger: Trigger; basis: MandateBasis } | undefined
+    const accepted = this.accepted(thread.key)
+    const tickets = this.ticketsOnThread(thread)
+    for (const id of thread.pending) {
+      const trigger = this.repo.triggers.get(id)
+      if (!trigger || trigger.source !== 'github' || trigger.meta.agentPull !== true
+        || (trigger.meta.kind !== 'inline' && trigger.meta.kind !== 'review')
+        || accepted.has(id) || this.owners(trigger).length) continue
+      const gate = policy.gate(trigger, thread, tickets)
+      if (!gate.admissible || gate.strength !== 'explicit'
+        || (gate.basis.via !== 'trustedReview' && gate.basis.via !== 'addressed')) continue
+      reviews.push(id)
+      if (!primary || trigger.at >= primary.trigger.at) primary = { trigger, basis: gate.basis }
+    }
+    if (!primary) return
+    const at = this.now()
+    const { trigger, basis } = primary
+    const id = key('eval', thread.key, 'pull-review', policy.version, at, ...reviews)
+    const evaluation: Evaluation = { id, threadKey: thread.key, triggerIds: reviews, primary: trigger.id,
+      strength: 'explicit', actor: trigger.actor, basis, policyVersion: policy.version, startedAt: at, deadline: at }
+    const routed = new Set(reviews)
+    thread.pending = thread.pending.filter(item => !routed.has(item))
+    if (!thread.evaluating) delete thread.expired
+    this.repo.threads.save(thread)
+    const title = `Address review feedback on PR #${trigger.meta.number}`
+    this.decideEval(thread, evaluation, { kind: 'accept', title, scope: title, name: `review-pr-${trigger.meta.number}`, reason: { code: 'explicitRouted' },
+      note: 'Read the submitted reviews and inline threads on the current PR. Address each actionable item, run the relevant checks, and push verified changes to the existing PR branch. Reply with the outcome for each review item, including any item that requires no change or is blocked.' })
+  }
+
   /** Start one Eval of the Triggers queued on a Thread, judged by the gate, and ask the assessor for it. */
   start(threadKeyValue: string, policy: Policy): void {
     const thread = this.repo.threads.get(threadKeyValue)!

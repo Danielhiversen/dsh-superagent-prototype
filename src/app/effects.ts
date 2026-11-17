@@ -7,6 +7,7 @@ export class Later extends Error {}
 export const FAILURES_BEFORE_ERROR = 3
 import type { HealthBoard, HealthEntry } from '../infra/health.ts'
 import type { Store } from './store.ts'
+import type { CommitReviewCi, ReviewResolution } from './review-resolution.ts'
 
 export interface EffectPayloads {
   /** Build an Eval's candidate card and relay it to the main Session; the key is the Eval ID. */
@@ -21,6 +22,8 @@ export interface EffectPayloads {
   notice: { value: Record<string, unknown>; summary: string }
   /** Send a message for a Channel through its Source; the key is the message ID, whose receipt the Outbox keeps. */
   reply: Record<string, never>
+  reviewResolution: ReviewResolution
+  commitReviewCi: CommitReviewCi
 }
 export type EffectKind = keyof EffectPayloads
 interface Handler<K extends EffectKind> {
@@ -74,6 +77,11 @@ export class Effects {
   }
   pending(kind: EffectKind, key?: string): boolean {
     return key === undefined ? !!this.store.db.prepare('SELECT 1 FROM effect WHERE kind = ? LIMIT 1').get(kind) : !!this.store.db.prepare('SELECT 1 FROM effect WHERE kind = ? AND key = ?').get(kind, key)
+  }
+  /** Read the currently queued payload, including ones that are waiting to retry. */
+  queued<K extends EffectKind>(kind: K, key: string): EffectPayloads[K] | undefined {
+    const row = this.store.db.prepare('SELECT value FROM effect WHERE kind = ? AND key = ?').get(kind, key)
+    return row ? JSON.parse(String(row.value)) as EffectPayloads[K] : undefined
   }
   /** Drops a queued row by kind and key; if it is already running, that attempt finishes normally. */
   cancel(kind: EffectKind, key: string): void {

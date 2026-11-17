@@ -10,6 +10,7 @@ import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh
 import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
 import { CliError } from './commands.ts'
+import { reviewCommitHook, reviewHooks, reviewPushHook, reviewSocket, reviewSocketClient } from './commit-review.ts'
 
 const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
@@ -80,6 +81,16 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   const { stateDir, repository, github, feishu } = deployment
   const dir = workerBin(stateDir)
   await mkdir(dir, { recursive: true })
+  const hooks = reviewHooks(stateDir)
+  await mkdir(hooks, { recursive: true })
+  const review = join(hooks, 'request-review')
+  await own(review, '#!/bin/sh\n' + MARKER + '\nexec ' + shellQuote(process.execPath)
+    + ' -e ' + shellQuote(reviewSocketClient) + ' "$@"\n', 0o755)
+  const request = [shellQuote(review), shellQuote(reviewSocket(stateDir))].join(' ')
+  for (const hook of ['prepare-commit-msg', 'pre-applypatch', 'pre-merge-commit']) {
+    await own(join(hooks, hook), `#!/bin/sh\n${MARKER}\n${reviewCommitHook(request)}\n`, 0o755)
+  }
+  await own(join(hooks, 'pre-push'), `#!/bin/sh\n${MARKER}\n${reviewPushHook}\n`, 0o755)
   const before = await readdir(dir)
   for (const name of before) { const file = join(dir, name); if (!await written(file)) throw new SetupError('foreignFile', { file }) }
   // Workers may be running concurrently: write each shim to a temp file and atomically rename it so no command ever resolves past the shim directory.
@@ -97,7 +108,15 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   ].join('\n')
   const run = (program: string): string => `${withoutShims}\nexec ${shellQuote(program)} "$@"`
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
-  await shim('gh', run(github.cli))
+  await shim('gh', [
+    'if test "$#" -ge 2 && test "$1" = pr && test "$2" = merge; then',
+    '  git_dir=$(git rev-parse --absolute-git-dir 2>/dev/null || :)',
+    '  if test -n "$git_dir" && test -f "$git_dir/superagent-review/baseline"; then',
+    '    echo "The worker account submits reviewed pull requests and cannot merge them." >&2; exit 1',
+    '  fi',
+    'fi',
+    run(github.cli),
+  ].join('\n'))
   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
     await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
@@ -107,6 +126,7 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     MARKER,
     // Make git refuse to commit without an explicit identity set by the worker instead of guessing from the operator's OS user.
     '[user]', '\tuseConfigOnly = true',
+    '[core]', `\thooksPath = ${gitQuote(hooks)}`,
     '[credential]', '\thelper =',
     '[credential "https://github.com"]', `\thelper = ${gitQuote(credentialHelper(github.cli))}`,
     '[url "https://github.com/"]', '\tinsteadOf = git@github.com:', '\tinsteadOf = ssh://git@github.com/',
@@ -114,6 +134,27 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
     '[filter "lfs"]', '\tclean = git-lfs clean -- %f', '\tsmudge = git-lfs smudge -- %f', '\tprocess = git-lfs filter-process', '\trequired = true',
   ].join('\n') + '\n')
 }
+
+/** Refresh a GitHub ticket branch before a worker starts or resumes an assignment. */
+export const syncTicketBranch = [
+  'set -eu',
+  'origin=$(git config --get remote.origin.url 2>/dev/null) || exit 0',
+  'repo=$DSH_SUPERAGENT_GITHUB_REPOSITORY',
+  'case "\${origin%.git}" in "https://github.com/$repo"|"git@github.com:$repo"|"ssh://git@github.com/$repo") ;; *) exit 0 ;; esac',
+  'branch=$(git symbolic-ref --quiet --short HEAD)',
+  'test "$branch" != main || { echo "Check out a ticket branch before starting work." >&2; exit 1; }',
+  'git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main',
+  'upstream=$(git rev-parse FETCH_HEAD)',
+  'git merge-base --is-ancestor "$upstream" HEAD && exit 0',
+  'if test -d "$(git rev-parse --git-path rebase-merge)" || test -d "$(git rev-parse --git-path rebase-apply)"; then echo "Finish the existing rebase first." >&2; exit 1; fi',
+  // Continuing an open PR must preserve its published commits. The worker can merge main and resolve conflicts.
+  'test -z "${DSH_SUPERAGENT_GITHUB_PR_HEAD:-}" || exit 0',
+  'export GIT_COMMITTER_NAME=$DSH_SUPERAGENT_GITHUB_ACCOUNT GIT_COMMITTER_EMAIL=$DSH_SUPERAGENT_GITHUB_COMMIT_EMAIL',
+  'if ! git rebase --no-fork-point --no-autostash "$upstream"; then',
+  '  if test -d "$(git rev-parse --git-path rebase-merge)" || test -d "$(git rev-parse --git-path rebase-apply)"; then git rebase --abort; fi',
+  '  echo "Could not rebase the ticket branch onto current origin/main." >&2; exit 1',
+  'fi',
+].join('\n')
 
 /** Applies environment overrides and prepends worker shims to `process.env.PATH`, returning a restore callback. */
 export function applyEnvironment(variables: Record<string, string | undefined>, stateDir: string, path: string): () => void {

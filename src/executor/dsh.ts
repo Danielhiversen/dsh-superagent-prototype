@@ -8,7 +8,8 @@ import { key, latestAssignment, latestReport, liveTicket, runningAssignment, thr
 import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
-import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
+import { enableCommitReview, reviewHooks, workspaceOwnsGit } from '../infra/commit-review.ts'
+import { runAsWorker, syncTicketBranch, verifyDirectory } from '../infra/environment.ts'
 import type { RoleModel, Settings } from '../policy.ts'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { resolveRoleModel, selectRoleModel } from '../app/role-models.ts'
@@ -17,6 +18,7 @@ import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { WorktreeNameSchema } from '../app/assessment.ts'
+import { commitReviewCiKey, reviewResolutionKey } from '../app/review-resolution.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
@@ -70,7 +72,7 @@ export interface ExecutorHost {
     | 'assignmentInterrupted'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
-  readonly effects: Pick<Effects, 'enqueue' | 'handle'>
+  readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'pending'>
   /** The `worker` health entry, which reports whether background worker event handling failed. */
   readonly health: HealthEntry
   readonly machine: Pick<Machine, 'stateDir'>
@@ -317,6 +319,7 @@ export class DshExecutor implements Executor {
         }
         const input = ticket.inputs.find(item => item.id === inputId)
         try {
+          await enableCommitReview(ticket.execution?.directory ?? '', reviewHooks(this.host.machine.stateDir), this.host.lifetime)
           // Recreate the worker session if it was externally deleted.
           if (!this.host.context.agents.get(sessionId as SessionId)) {
             await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
@@ -445,11 +448,19 @@ export class DshExecutor implements Executor {
       if (!current()) return
     }
     if (!current()) return
+    // Stop the preceding assignment's background work before changing its checkout.
+    await this.stopped(ticket.id)
+    if (!current()) return
+    const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
+    if (env.DSH_SUPERAGENT_GITHUB_REPOSITORY && await workspaceOwnsGit(workspace, this.host.lifetime)) {
+      await runAsWorker(this.host.context.subprocess, ['sh', '-c', syncTicketBranch], workspace,
+        AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)]), env)
+    }
+    if (!current()) return
+    await enableCommitReview(workspace, reviewHooks(this.host.machine.stateDir), this.host.lifetime)
+    if (!current()) return
     const sessionId = workerSessionId(ticket.id)
     const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')
-    if (!current()) return
-    // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.
-    await this.stopped(ticket.id)
     if (!current()) return
     // A message put back for this Assignment may still wait in the Session, kept by a restart's cancel or persisted across a
     // crash, where this launch's message would take it into a step beside the copy delivered next: that copy is the only one.
@@ -460,7 +471,19 @@ export class DshExecutor implements Executor {
     const later = ticket.assignments.length > 1
     const told = later && await this.host.sessions.holds(sessionId, first)
     if (!current()) return
-    const retried = ticket.assignments.at(-2)?.endedReason === 'retried' ? { note: RETRIED } : {}
+    const preceding = ticket.assignments.at(-2)?.endedReason
+    const retrying = preceding === 'retried' || preceding === 'reviewRetry'
+    const retryNote = preceding === 'reviewRetry' ? 'Recovery resumed this incomplete review.' : RETRIED
+    const newestReview = retrying && source?.source === 'github' && source.meta.isPr === true
+      ? ticket.inputs.flatMap(input => {
+        if (input.kind !== 'trigger' || !input.human || input.context) return []
+        const trigger = this.host.store.triggers.get(input.triggerId)
+        return trigger?.source === 'github' && trigger.meta.number === source.meta.number
+          && (trigger.meta.kind === 'review' || trigger.meta.kind === 'inline') ? [trigger] : []
+      }).at(-1) : undefined
+    const retried = retrying ? { note: newestReview
+      ? `${retryNote} Read the latest review at trigger/${newestReview.id} before working. Check each finding on the current PR against the exact pushed diff, test results and replies. An earlier fix or acknowledgement does not settle a later finding.`
+      : retryNote } : {}
     const assignmentText = ticket.execution?.assignment ?? ''
     const { text: brief, chars, read } = capped(assignmentText, ASSIGNMENT_CHARS, `ticket/${ticket.id}/assignment`)
     const card = told || !source ? undefined : await this.triggerCard(ticket, source.id)
@@ -515,7 +538,7 @@ export class DshExecutor implements Executor {
       const assignment = ticket && runningAssignment(ticket)
       if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing()) return
       const switchModel = error instanceof LlmError && (error.failure.status === 429 || error.failure.code === 'RATE_LIMIT'
-        || error.failure.status === 402 || /\binsufficient balance\b/i.test(error.failure.message))
+        || error.failure.status === 402 || error.failure.status === 410 || /\binsufficient balance\b/i.test(error.failure.message))
       if (switchModel) {
         const chain = this.failover.get(assignment.id) ?? { attempts: 0, tried: new Set<string>() }
         this.failover.set(assignment.id, chain)
@@ -594,7 +617,7 @@ export class DshExecutor implements Executor {
           const { agent, chain } = fallback
           const selected = await this.nextFallback(agent, chain)
           if (!live() || this.host.context.agents.get(agent.id) !== agent) return
-          if (!selected) throw new Error(`All available worker models exhausted after rate limiting: ${String(error)}`)
+          if (!selected) throw new Error(`All available worker models exhausted after provider failure: ${String(error)}`)
           await selectRoleModel(this.host.context, agent, selected)
         }
         if (live()) {
@@ -678,14 +701,14 @@ export class DshExecutor implements Executor {
     const handedOff = (stored: Ticket) => {
       const assignment = runningAssignment(stored), report = assignment?.report
       const since = !!assignment?.deliveredAt && !!report && assignment.deliveredAt >= report.at
+      const person = this.personal.get(ticket.id)
+      if (report && person && person > report.at) return false
       return ((report?.state === 'ready' || !!stored.attention) && !since) || waitsForPerson(stored)
     }
     const before = live()
     if (!before || this.host.closing()) return
-    // A turn a person started in the Session is the person's work, which goes on in the background as any turn's does.
-    const report = runningAssignment(before)?.report, person = this.personal.get(ticket.id)
     // The worker read what reached it before a turn that ended: one it handed off with, or one whose background work ended.
-    if (handedOff(before) && !(report && person && person > report.at)) {
+    if (handedOff(before)) {
       this.host.engine.turnEnded(ticket.id, idle.id)
       this.handOff(ticket.id, agent)
       return
@@ -720,6 +743,12 @@ export class DshExecutor implements Executor {
     }
     // The worker may have reported while its turn ended; a blocked or failed report a person's message has lifted is stale.
     if (handedOff(current)) return
+    const origin = this.host.store.triggers.get(current.origin.triggerId)
+    const pendingPrs = (current.follows ?? []).filter(follow => !follow.closed && follow.thread.startsWith('github:'))
+      .map(follow => Number(follow.thread.slice('github:'.length)))
+    if (origin?.source === 'github' && origin.meta.isPr === true && typeof origin.meta.number === 'number') pendingPrs.push(origin.meta.number)
+    if (this.host.effects.pending('commitReviewCi', commitReviewCiKey(ticket.id))
+      || pendingPrs.some(pr => this.host.effects.pending('reviewResolution', reviewResolutionKey(ticket.id, pr)))) return
     const last = agent.session.snapshotEvents().filter(event => event.type === 'assistant/message').at(-1)
     const text = last?.type === 'assistant/message'
       ? last.data.message.content.filter(block => block.type === 'text').map(block => block.text).join('\n').trim() : ''

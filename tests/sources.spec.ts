@@ -871,6 +871,7 @@ describe('github source', () => {
     const timestamp = new Date(Date.now() + 1000).toISOString()
     const comment = { id: 5, body: 'Please fix the regression', user: { login: 'alice', type: 'User' }, updated_at: timestamp }
     const routes: Record<string, unknown> = { notifications: [], pulls: [own, openPull(13)],
+      'issues/12': issue(12, { pull_request: { url: own.html_url } }),
       'pulls/12': own, 'pulls/13': openPull(13), 'issues/12/comments': [comment, { ...comment, id: 9, user: own.user }],
       'pulls/12/comments': [{ ...comment, id: 6 }],
       'pulls/12/reviews': [{ id: 7, user: comment.user, submitted_at: timestamp, state: 'CHANGES_REQUESTED' },

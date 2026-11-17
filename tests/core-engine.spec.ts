@@ -124,6 +124,60 @@ describe('eval', () => {
     expect(h.outbox).toEqual([{ id: key('ack', '1'), channel: trigger('1').channel, text: 'ok', kind: 'acknowledgement', ticketId: ticket.id }])
     expect(h.executor.start).toHaveBeenCalledOnce()
   })
+  it('acknowledges an explicit GitHub PR follow-up once before the worker reads it', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const pull = { source: 'github', id: '18' }
+    h.engine.bindThread(ticketId, pull, true)
+    const request = trigger('2', { source: 'github', threads: [pull], addressed: 'mention',
+      channel: { source: 'github', thread: 'github:18', address: { number: '18' } },
+      meta: { isPr: true, number: 18, kind: 'conversation' } })
+    h.engine.receive(request)
+    h.engine.receive(request)
+    expect(h.outbox.filter(message => message.id === key('ack', '2'))).toMatchObject([
+      { ticketId, channel: request.channel, kind: 'acknowledgement' },
+    ])
+    h.settle()
+    expect(h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'Working on it' }).reused).toBe(true)
+    expect(h.outbox.filter(message => message.id === key('ack', '2'))).toHaveLength(1)
+  })
+
+  it('reports an exhausted PR follow-up to GitHub once without leaking the worker summary', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const pull = { source: 'github', id: '18' }
+    h.engine.bindThread(ticketId, pull, true)
+    const request = trigger('2', { source: 'github', threads: [pull], addressed: 'mention',
+      channel: { source: 'github', thread: 'github:18', address: { number: '18' } },
+      meta: { isPr: true, number: 18, kind: 'conversation' } })
+    h.engine.receive(request); h.settle()
+    for (let attempt = 0; attempt < 3; attempt++) {
+      h.engine.report(ticketId, { state: 'waiting', summary: 'Private tool error' })
+      h.settle()
+      expect(h.outbox.filter(message => message.kind === 'notice')).toHaveLength(attempt === 2 ? 1 : 0)
+    }
+    h.engine.report(ticketId, { state: 'failed', summary: 'Another private error' })
+    const notices = h.outbox.filter(message => message.kind === 'notice')
+    expect(notices).toMatchObject([{ ticketId, channel: request.channel }])
+    expect(notices[0]!.text).not.toContain('Private tool error')
+    expect(notices[0]!.text).toContain('stopped')
+  })
+
+  it('does not acknowledge context-only, unaddressed, or unauthorized GitHub PR activity', () => {
+    const h = harness()
+    const ticketId = accepted(h).ticketId!
+    const pull = { source: 'github', id: '18' }
+    h.engine.followForContext(ticketId, pull)
+    const message = { source: 'github', threads: [pull],
+      channel: { source: 'github', thread: 'github:18', address: { number: '18' } },
+      meta: { isPr: true, number: 18, kind: 'conversation' } }
+    h.engine.receive(trigger('2', { ...message, addressed: 'mention' }))
+    h.engine.bindThread(ticketId, pull, true)
+    h.engine.receive(trigger('3', message))
+    h.engine.receive(trigger('4', { ...message, actor: guest, addressed: 'mention' }))
+    expect(h.outbox.map(item => item.id)).toEqual([key('ack', '1')])
+  })
+
   it('refuses to decide an eval that a later eval replaced, and decides the later one', async () => {
     const h = harness()
     h.engine.receive(trigger('1')); h.pump()
@@ -805,6 +859,101 @@ describe('worker reports', () => {
     expect(h.repo.tickets.get(id)?.assignments).toHaveLength(3)
     expect(h.repo.tickets.get(id)?.assignments.at(-1)?.report?.state).toBe('failed')
   })
+  it.each(['origin', 'follow-up'])('resumes an unfinished PR review that went idle (%s)', source => {
+    const h = harness()
+    const pull = { source: 'github', id: '17' }
+    const review = (id: string) => trigger(id, { source: 'github', threads: [pull],
+      meta: { isPr: true, number: 17, kind: 'review' } })
+    let ticketId: string
+    if (source === 'origin') {
+      // A review ticket can start from a PR before it has explicitly bound that PR.
+      h.engine.receive(review('1')); h.pump()
+      ticketId = h.decide(h.requests.at(-1)!, {
+        kind: 'accept', title: 'Address review', scope: 'review', reason: 'requested', acknowledgement: 'ok',
+      }).ticketId!
+    } else {
+      ticketId = accepted(h).ticketId!
+      h.engine.bindThread(ticketId, pull, false)
+      h.engine.receive(review('2'))
+    }
+    h.settle()
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      h.engine.report(ticketId, { state: 'waiting', summary: 'Local edits remain after a Bash validation error' })
+      h.settle()
+    }
+
+    const ticket = h.repo.tickets.get(ticketId)!
+    expect(ticket.assignments.map(item => item.endedReason)).toEqual(['reviewRetry', 'reviewRetry', undefined])
+    expect(ticket.assignments.at(-1)?.report).toMatchObject({
+      state: 'failed', summary: expect.stringContaining('Local edits remain'),
+    })
+    expect(ticketStage(ticket)).toEqual({ stage: 'person', action: 'failed' })
+    expect(ticket.inputs).toContainEqual(expect.objectContaining({
+      kind: 'text', text: expect.stringContaining('Re-read the GitHub review'),
+    }))
+    expect(waitsForPerson(ticket)).toBe(true)
+  })
+  it('leaves ordinary PR conversation, context-only review inputs and human questions waiting', () => {
+    const h = harness()
+    const pull = { source: 'github', id: '17' }
+    const owner = accepted(h).ticketId!
+    const observer = accepted(h, '2', 'other').ticketId!
+    h.engine.bindThread(owner, pull, false)
+    h.engine.followForContext(observer, pull)
+    h.engine.receive(trigger('3', { source: 'github', threads: [pull], meta: { isPr: true, number: 17, kind: 'conversation' } }))
+    h.settle()
+    const ordinary = h.engine.report(owner, { state: 'waiting', summary: 'Acknowledged a conversation' })
+    expect(ordinary.assignments).toHaveLength(1)
+    expect(ordinary.assignments.at(-1)?.report?.state).toBe('waiting')
+
+    h.engine.receive(trigger('4', { source: 'github', threads: [pull], meta: { isPr: true, number: 17, kind: 'inline' } }))
+    h.settle()
+    const passive = h.engine.report(observer, { state: 'waiting', summary: 'Read related PR' })
+    expect(passive.assignments).toHaveLength(1)
+    expect(passive.assignments.at(-1)?.report?.state).toBe('waiting')
+    h.engine.report(owner, { state: 'progress', summary: 'Clarification needed', question: 'Which behavior should this preserve?' })
+    const asked = h.engine.report(owner, { state: 'waiting', summary: 'Waiting for a decision' })
+    expect(asked.assignments).toHaveLength(1)
+    expect(ticketStage(asked)).toEqual({ stage: 'person', action: 'answer' })
+
+    h.engine.handback(owner, '4', 'This review requests a separate change')
+    h.engine.report(owner, { state: 'progress', summary: 'Handed the review back', question: null })
+    const handedBack = h.engine.report(owner, { state: 'waiting', summary: 'Waiting for work in this ticket' })
+    expect(handedBack.assignments).toHaveLength(1)
+    expect(handedBack.assignments.at(-1)?.report?.state).toBe('waiting')
+  })
+  it('keeps a verified review settled through CI and gives a later review its own retries', () => {
+    const h = harness()
+    const pull = { source: 'github', id: '17' }
+    const review = (id: string) => trigger(id, { source: 'github', threads: [pull],
+      meta: { isPr: true, number: 17, kind: 'review' } })
+    const ticketId = accepted(h).ticketId!
+    h.engine.bindThread(ticketId, pull, false)
+    h.tick(1)
+    h.engine.receive(review('2')); h.settle()
+    h.engine.report(ticketId, { state: 'waiting', summary: 'Retry this review' }); h.settle()
+    h.tick(1)
+    h.engine.report(ticketId, { state: 'ready', summary: 'First review verified' })
+
+    h.tick(1)
+    h.engine.receive(trigger('3', { source: 'github', threads: [pull], human: false, meta: { isPr: true, ci: true } }))
+    h.settle()
+    h.engine.report(ticketId, { state: 'progress', summary: 'CI finished' })
+    const settled = h.engine.report(ticketId, { state: 'waiting', summary: 'Waiting for the reviewer' })
+    expect(settled.assignments).toHaveLength(2)
+    expect(settled.assignments.at(-1)?.report?.state).toBe('waiting')
+
+    h.tick(1)
+    h.engine.receive(review('4')); h.settle()
+    for (let i = 0; i < 3; i++) {
+      h.engine.report(ticketId, { state: 'waiting', summary: 'Second review is unfinished' })
+      h.settle()
+    }
+    const exhausted = h.repo.tickets.get(ticketId)!
+    expect(exhausted.assignments).toHaveLength(4)
+    expect(exhausted.assignments.at(-1)?.report?.state).toBe('failed')
+  })
   it('retries an open GitHub PR review when the worker reports dropped, then leaves it retryable after exhaustion', () => {
     const h = harness()
     h.engine.receive(trigger('1', { source: 'github', threads: [{ source: 'github', id: '12' }],
@@ -816,6 +965,11 @@ describe('worker reports', () => {
     for (let attempt = 0; attempt < 3; attempt++) {
       h.engine.report(ticketId, { state: 'dropped', summary: 'Parser still needs work' })
       h.settle()
+      if (attempt === 0) {
+        const recovery = h.repo.tickets.get(ticketId)!.inputs.at(-1)
+        expect(recovery).toMatchObject({ kind: 'text', text: expect.stringContaining('Re-read the GitHub review') })
+        expect(recovery).not.toMatchObject({ text: expect.stringContaining('Parser still needs work') })
+      }
     }
     const ticket = h.repo.tickets.get(ticketId)!
     expect(ticket.ended).toBeUndefined()

@@ -48,6 +48,8 @@ describe('canRetry', () => {
     // The worker has the person's message, as the Ticket's stage says, so a retry would only interrupt it.
     ['a failed Ticket a person answered since', false, ticket({ ...answered, assignments: [reportedAt('failed')] })],
     // Unless delivering that message failed: a new Assignment starts the worker again and takes the message.
+    ['a failed Ticket with an undelivered human reply', true,
+      ticket({ ...answered, undelivered: ['i'], assignments: [reportedAt('failed')] })],
     ['a failed Ticket whose delivery of a person\'s answer failed', true,
       ticket({ ...answered, delivery: { error: 'offline', at: '' }, assignments: [reportedAt('failed')] })],
     ['a working Ticket whose Input could not be delivered', true, ticket({ delivery: { error: 'offline', at: '' } })],

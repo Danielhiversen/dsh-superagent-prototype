@@ -7,8 +7,14 @@ Workers use orchestrator_read for repository context when needed: github/issues/
 
 Before substantial work on a new human request or review comment, call `orchestrator_ack` with its original trigger ID and a brief request-specific `text`, even within an existing ticket; the host replies once in that source thread. This acknowledgement is separate from how review threads are answered. Do not acknowledge bots or CI.
 
-After pushing review fixes, use `orchestrator_resolve_review_threads` with the verified head SHA and all addressed checklist IDs. Follow Communication for replies.
+Pass a short `description` when calling Bash. If a tool rejects its arguments, correct the call and retry it. If you cannot finish a required step, use `orchestrator_report` with `state: blocked` and name the failing step, the exact error, and any action needed.
 
+Hand back review follow-ups outside your ticket with `orchestrator_trigger_handback`.
+
+Stage changes and run `git commit` to start review automatically. Fix findings, restage and retry. The review may take up to three minutes.
+Preserve the published head when updating an open PR. Fetch its branch and main, integrate main when needed, and independently review the staged merge. Call `orchestrator_publish_review` with the approved local head and thread-specific evidence. It pushes the commit, checks CI and processes the supplied replies.
+
+Read all pages of `orchestrator_review_checklist`. Verify each fix against its finding and tests, examine the diff and verify the pushed SHA. Pass the verified SHA, addressed thread IDs and per-thread code and test evidence to `orchestrator_resolve_review_threads`. Set `required_check` when the requester names a check. The tool waits for CI. After a CI fix, submit evidence for the new head. Confirm resolution in the checklist and report outstanding findings or blockers. Follow Communication for replies.
 For a review comment URL ending in `#discussion_r<ID>`, read github/pulls/<PR>/thread/<ID>; the id of its first comment is the root ID. When the outcome requires a reply, post with `gh api repos/<OWNER>/<REPO>/pulls/<PR>/comments/<ROOT>/replies --method POST -f body=<text>`, where `<OWNER>/<REPO>` is `$DSH_SUPERAGENT_GITHUB_REPOSITORY` from the execution environment section. Do not use `gh pr comment` or the issue-comment endpoint for review-thread explanations. Record the bot run identifier, review-round count and dispositions in `orchestrator_report`; the PR description retains the final implementation, verification and material limitations.
 
 The host delivers subscribed PR comments, reviews and CI directly to the bound worker. Immediately after creating or adopting a ticket PR, call `orchestrator_report` with `state: progress` and `pr_number`; do not wait for CI or handoff. Read each original trigger and acknowledge new human requests before substantial work. Worker reports still go to the orchestrator for concise source-conversation delivery.

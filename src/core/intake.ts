@@ -3,6 +3,7 @@ import { key } from './ids.ts'
 import { isoTime, liveTicket, threadKey } from './model.ts'
 import type { Ticket, Trigger } from './model.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
+import type { Replies } from './replies.ts'
 import type { Tickets } from './tickets.ts'
 
 export type ReceiveResult = 'stored' | 'duplicate' | 'filtered'
@@ -14,7 +15,7 @@ export type ReceiveResult = 'stored' | 'duplicate' | 'filtered'
  * Engine delegates trigger reception to this part.
  */
 export class Intake extends EnginePart {
-  constructor(options: EngineOptions, private readonly tickets: Tickets) { super(options) }
+  constructor(options: EngineOptions, private readonly tickets: Tickets, private readonly replies: Replies) { super(options) }
 
   receive(received: Trigger): ReceiveResult {
     // Normalize source timestamps (such as GitHub whole seconds) to canonical ISO form.
@@ -55,8 +56,10 @@ export class Intake extends EnginePart {
     this.repo.triggers.saveDisposition(trigger.id, disposition)
     // A person's message that no ticket decides, such as one that reached only tickets a person stopped or that follow the
     // Thread for context, and every bot's, goes to Eval.
-    if (!this.owners(trigger).length) this.queueForEval(trigger)
+    const owners = this.owners(trigger)
+    if (!owners.length) this.queueForEval(trigger)
     for (const ticketId of fanout) this.tickets.wake(ticketId)
+    if (owners.length === 1) this.replies.acknowledgePullFollowup(owners[0]!, trigger)
     this.emit('trigger.received', { triggerId: trigger.id, threads: trigger.threads.map(threadKey) })
     return 'stored'
   }

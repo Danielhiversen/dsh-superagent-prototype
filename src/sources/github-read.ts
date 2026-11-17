@@ -6,11 +6,14 @@ import { CommentSchema, IssueSchema, isHumanLogin, reviewPlace, type GithubComme
 import type { ContextMessage, ThreadContext } from './kind.ts'
 
 const CheckSchema = z.looseObject({ name: z.string(), status: z.string(), conclusion: z.string().nullable() })
-const StatusSchema = z.looseObject({ context: z.string(), state: z.string() })
+export const REQUIRED_CIRCLECI = 'ci/circleci: build'
+const CIRCLECI_GITHUB_BOT_ID = 127350680
+const StatusSchema = z.looseObject({ context: z.string(), state: z.string(),
+  creator: z.looseObject({ id: z.number() }).nullish() })
 type Check = Pick<z.infer<typeof CheckSchema>, 'name' | 'status' | 'conclusion'>
 type Status = Pick<z.infer<typeof StatusSchema>, 'context' | 'state'>
 
-export interface CiSnapshot { head: string; checks: Check[]; statuses: Status[] }
+export interface CiSnapshot { head: string; checks: Check[]; statuses: Status[]; circleci?: string }
 /** Check conclusions and status states that count as failures; `success`, `neutral`, `skipped`, and `stale` do not. */
 const FAILING = new Set(['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'error'])
 export function ciCounts(snapshot: CiSnapshot): { failed: number; running: number } {
@@ -64,8 +67,9 @@ export async function pullChecks(commands: Commands, head: string, tally?: Tally
   const statuses = await commands.pages(StatusSchema, `commits/${head}/statuses?per_page=100`, tally)
   const latest = new Map<string, string>()
   for (const status of statuses) if (!latest.has(status.context)) latest.set(status.context, status.state)
+  const circleci = statuses.find(status => status.context === REQUIRED_CIRCLECI && status.creator?.id === CIRCLECI_GITHUB_BOT_ID)?.state
   const checks = runs.map(({ name, status, conclusion }) => ({ name, status, conclusion }))
-  return { head, checks: checks.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+  return { head, ...(circleci ? { circleci } : {}), checks: checks.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     statuses: [...latest].map(([context, state]) => ({ context, state })).sort((a, b) => a.context.localeCompare(b.context)) }
 }
 

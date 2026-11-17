@@ -224,6 +224,8 @@ export interface Assignment {
   endedAt?: string
   endedReason?: string
   readyRejection?: string
+  /** Latest accepted ready report, retained when a later turn updates the report. */
+  reviewReadyAt?: string
   report?: { state: ReportState; summary: string; at: string }
   /** When Inputs last reached the worker; one at or after `report.at` means the worker has been busy with Inputs since that report. */
   deliveredAt?: string

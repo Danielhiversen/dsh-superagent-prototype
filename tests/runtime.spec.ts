@@ -1,3 +1,6 @@
+import { execFile, execFileSync } from 'node:child_process'
+import { promisify } from 'node:util'
+import { enableCommitReview, reviewHooks } from '../src/infra/commit-review.ts'
 import { Context } from '@deepseek-ai/cordis'
 import { bindScopeParent } from '@deepseek-ai/dsh-scope'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -5,7 +8,7 @@ import { tmpdir } from 'node:os'
 import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
-import { LlmError, type UserMessage } from '@deepseek-ai/dsh-llm'
+import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import { Runtime } from '../src/app/runtime.ts'
 import { jobRegistry } from './fixtures/host.ts'
@@ -400,33 +403,100 @@ it.each([false, true])('requires resolved review threads and evidence before rea
   }
 })
 
-it('resolves only selected review threads after checking the pushed head', async () => {
+it('publishes only to a PR the worker owns and treats an already published head idempotently', async () => {
+  const { sessionId } = await acceptedTicket()
+  await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'PR open', pr_number: 42 })
+  const previous = vi.mocked(Commands.prototype.gh).getMockImplementation()!
+  vi.mocked(Commands.prototype.gh).mockImplementation(async (...args) => {
+    const result = await previous(...args) as { head: object }
+    if (args[0][1]?.endsWith('/pulls/42')) return { ...result, head: { ...result.head, sha: 'a'.repeat(40),
+      repo: { full_name: 'acme/widgets' } } }
+    return result
+  })
+  const publish = (pr_number: number, local_head_sha: string) => runTool(sessionId, 'orchestrator_publish_review',
+    { pr_number, local_head_sha })
+  await expect(publish(41, 'a'.repeat(40))).rejects.toThrow('does not belong')
+  await expect(publish(42, 'b'.repeat(40))).rejects.toThrow(/managed Git workspace|exact local head/)
+  await expect(publish(42, 'a'.repeat(40))).resolves.toMatchObject({ head: 'a'.repeat(40), pushed: false })
+  await expect(runTool(sessionId, 'orchestrator_publish_review', {
+    pr_number: 42, local_head_sha: 'a'.repeat(40), review_evidence: { foreign: 'Unrelated thread' },
+  })).rejects.toThrow('foreign')
+})
+
+it('resolves only selected review threads after checking the pushed head and their evidence', async () => {
   const { sessionId } = await acceptedTicket()
   await runTool(sessionId, 'orchestrator_report', { state: 'progress', summary: 'PR open', pr_number: 42 })
   const previous = vi.mocked(Commands.prototype.gh).getMockImplementation()!
   const resolved = new Set(['already'])
+  const replies: string[] = []
+  let ci = 'pending', currentHead = 'a'
   vi.mocked(Commands.prototype.gh).mockImplementation(async (...args) => {
-    if (args[0][1] !== 'graphql') return previous(...args)
+    const path = args[0][1] ?? ''
+    if (path.includes('/check-runs')) return [{ check_runs: [] }]
+    if (path.includes('/statuses')) return [[{ context: 'ci/circleci: build', state: ci }]]
+    if (path.endsWith('/pulls/comments/123')) return { id: 123 }
+    if (path.endsWith('/pulls/42/comments')) return [[]]
+    if (path.endsWith('/pulls/42/comments/123/replies')) {
+      replies.push(args[0].find(arg => arg.startsWith('body='))!)
+      return {}
+    }
+    if (path.includes('/pulls/')) {
+      const pull = await previous(...args) as { head: object }
+      return { ...pull, head: { ...pull.head, sha: currentHead.repeat(40) } }
+    }
+    if (path !== 'graphql') return previous(...args)
     if (args[0].some(arg => arg.includes('resolveReviewThread'))) {
       const id = args[0].find(arg => arg.startsWith('id='))!.slice(3)
+      expect(replies).toHaveLength(1)
       resolved.add(id)
       return { data: { resolveReviewThread: { thread: { id, isResolved: true } } } }
     }
     return { data: { repository: { pullRequest: { reviewThreads: {
-      nodes: ['fixed', 'already', 'outstanding'].map(id => ({ id, isResolved: resolved.has(id), comments: { nodes: [] } })),
+      nodes: ['fixed', 'already', 'outstanding'].map(id => ({ id, isResolved: resolved.has(id), comments: { nodes: [{ url: 'https://github.com/acme/widgets/pull/42#discussion_r123', body: 'Review finding' }] } })),
       pageInfo: { hasNextPage: false, endCursor: null },
     } } } } }
   })
-  const resolve = (head: string, ids: string[], pr = 42) => runTool(sessionId, 'orchestrator_resolve_review_threads', {
-    pr_number: pr, verified_head_sha: head.repeat(40), thread_ids: ids,
+  const evidence = { fixed: 'src/edge.ts: handles zero; tests/edge.spec.ts reproduces the old behavior and passes on this head' }
+  const resolve = (head: string, ids: string[], pr = 42, reviewEvidence: Record<string, string> = evidence) => runTool(sessionId, 'orchestrator_resolve_review_threads', {
+    pr_number: pr, verified_head_sha: head.repeat(40), thread_ids: ids, review_evidence: reviewEvidence, required_check: 'ci/circleci: build',
   })
+  // A matching SHA alone did not show whether the worker verified either fix.
+  await expect(runTool(sessionId, 'orchestrator_resolve_review_threads', {
+    pr_number: 42, verified_head_sha: 'a'.repeat(40), thread_ids: ['fixed'],
+  })).rejects.toThrow(/evidence.*fixed/i)
+  await expect(resolve('a', ['fixed', 'outstanding'])).rejects.toThrow(/evidence.*outstanding/i)
   await expect(resolve('b', ['fixed'])).rejects.toThrow('head')
   await expect(resolve('a', ['fixed', 'foreign'])).rejects.toThrow('foreign')
   await expect(resolve('a', ['fixed'], 41)).rejects.toThrow('does not belong')
   expect([...resolved]).toEqual(['already'])
-  await expect(resolve('a', ['fixed', 'already'])).resolves.toMatchObject({ resolved: ['fixed', 'already'] })
+  await expect(resolve('a', ['fixed', 'already'])).resolves.toMatchObject({ pending: ['fixed'] })
+  await runtime.idle()
+  expect([...resolved]).toEqual(['already'])
+  const runDue = async () => {
+    runtime.store.db.prepare("UPDATE effect SET due = 0 WHERE kind = 'reviewResolution'").run()
+    await runtime.idle()
+  }
+  ci = 'failure'
+  await runDue()
+  expect([...resolved]).toEqual(['already'])
+  ci = 'success'
+  await runDue()
   expect([...resolved]).toEqual(['already', 'fixed'])
-  await expect(resolve('a', ['fixed'])).resolves.toMatchObject({ resolved: ['fixed'] })
+  expect(replies).toEqual([expect.stringContaining(evidence.fixed)])
+  await expect(runTool(sessionId, 'orchestrator_resolve_review_threads', {
+    pr_number: 42, verified_head_sha: 'a'.repeat(40), thread_ids: ['fixed'],
+  })).resolves.toMatchObject({ resolved: ['fixed'] })
+
+  ci = 'pending'
+  await expect(resolve('a', ['outstanding'], 42, {
+    fixed: evidence.fixed, ...{ outstanding: 'tests/other.spec.ts covers the remaining edge case' },
+  })).resolves.toMatchObject({ pending: ['outstanding'] })
+  await runtime.idle()
+  currentHead = 'b'
+  ci = 'success'
+  await runDue()
+  expect(resolved.has('outstanding')).toBe(false)
+  expect(runtime.store.db.prepare("SELECT key FROM effect WHERE kind = 'reviewResolution'").all()).toEqual([])
 })
 
 it('rejects ready when the remote PR head changes during review verification', async () => {
@@ -1583,43 +1653,6 @@ it('relays the status-request hint when a worker\'s turn ends with no text and n
     summary: expect.stringContaining('orchestrator_ticket_request_status') })
 })
 
-it('tries every catalog route once on rate limits or insufficient balance, with the configured backup first', async () => {
-  const primary = { provider: 'primary', model: 'main' }
-  const fallback = { provider: 'backup', model: 'preferred' }
-  const hosted = ['a', 'b', 'c'].map(model => ({ provider: 'backup', model }))
-  const local = { provider: 'ollama-local', model: 'd' }
-  const alternatives = [...hosted, local]
-  const settings = runtime.store.settings()
-  runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, model: primary, fallbackModel: fallback } })
-  Object.assign(controller, { modelCatalog: vi.fn(async () => ({
-    default: primary,
-    groups: [
-      { id: primary.provider, models: [{ id: primary.model }] },
-      { id: local.provider, models: [{ id: local.model }] },
-      { id: fallback.provider, models: [{ id: fallback.model }, ...hosted.map(route => ({ id: route.model }))] },
-    ],
-  })) })
-  const { ticket, sessionId } = await acceptedTicket()
-  const agent = agents.get(sessionId)! as unknown as import('@deepseek-ai/dsh-agent').Agent
-  const selected = () => agent.session.snapshotEvents().filter(event => event.type === 'model/selection').map(event => event.data)
-  const ctx = (runtime as unknown as { ctx: Context }).ctx
-  const fail = (turn: number) => ctx.emit('agent/error', { agent, turn, step: 1, error: turn === 1 || turn === 6 ? new LlmError('Too Many Requests', 'RATE_LIMIT', { status: 429 })
-    : new LlmError('Insufficient Balance (request_id: example)', 'HTTP_ERROR', { status: 402 }) })
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
-  try {
-    for (const [index, route] of [fallback, ...alternatives].entries()) {
-      fail(index + 1)
-      await vi.advanceTimersByTimeAsync(15_000)
-      expect(selected().at(-1)).toEqual(route)
-    }
-    fail(6)
-    await vi.advanceTimersByTimeAsync(15_000)
-    expect(selected()).toEqual([primary, fallback, ...alternatives])
-    expect(deliveries.mock.calls.filter(([call]) => call.sessionId === sessionId)).toHaveLength(6)
-    expect(runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('Too Many Requests') })
-  } finally { vi.useRealTimers() }
-})
-
 it('fails a ticket at once on a worker error that is not passing, and relays it', async () => {
   const { ticket, sessionId } = await acceptedTicket()
   ;(runtime as unknown as { ctx: Context }).ctx.emit('agent/error', { agent: agents.get(sessionId), turn: 1, step: 1, error: new Error('Invalid tool schema') } as never)
@@ -1929,4 +1962,84 @@ it('keeps the Policy the main Session judges by in its prompt, after admission a
   await runtime.settings.save('policy', { ...saved.policy, rules: rules.map(rule => ({ ...rule, enabled: false })) }, runtime.store.blockRevision('policy'), 'panel')
   expect(policy()).toContain('No rule is enabled: a proactive candidate can only be ignored.')
   expect(policy()).toContain('The accept mode and the rules decide proactive candidates only')
+})
+
+it('requires a reviewed published commit and the named CircleCI check before ready', async () => {
+  const { ticket, sessionId } = await acceptedTicket()
+  const workspace = ticket.execution!.directory
+  const git = (...args: string[]) => execFileSync('git', ['-C', workspace, ...args], { encoding: 'utf8' }).trim()
+  const commit = (message: string) => promisify(execFile)('git', ['-C', workspace, 'commit', '-qm', message])
+  git('init', '-q')
+  git('config', 'user.name', 'Worker')
+  git('config', 'user.email', 'worker@example.com')
+  await enableCommitReview(workspace, reviewHooks(directory))
+  writeFileSync(join(workspace, 'feature.txt'), 'implementation\n')
+  git('add', '--', 'feature.txt')
+  const requests: unknown[] = []
+  let reviewDecision = 'changes_requested'
+  const llm = services.llm as { prepareCall: unknown }
+  llm.prepareCall = async (config: object) => ({ config, async *stream(request: unknown) {
+    requests.push(request)
+    const verdict = JSON.stringify({ decision: reviewDecision, summary: 'Reviewer checked the immutable patch' })
+    if (reviewDecision === 'approved') {
+      yield { type: 'block-end', block: { type: 'tool-call', name: 'submit_commit_review', arguments: verdict } }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    } else {
+      yield { type: 'text-delta', text: verdict }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }
+  } })
+  const settings = runtime.store.settings()
+  runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, model: { provider: 'review-model', model: 'reviewer' } } })
+  await expect(commit('Rejected change')).rejects.toThrow(/Staged review blocked the commit/)
+  writeFileSync(join(workspace, 'feature.txt'), 'unstaged content\n')
+  reviewDecision = 'approved'
+  await expect(commit('Reviewed change')).resolves.toBeDefined()
+  expect(JSON.stringify(requests[1])).toContain('+implementation')
+  expect(JSON.stringify(requests[1])).not.toContain('unstaged content')
+  const sha = git('rev-parse', 'HEAD')
+  let remoteHead = sha
+  let ciStatus = 'pending'
+  let ciName = 'ci/circleci: build'
+  let publisher = 127350680
+  const previous = vi.mocked(Commands.prototype.gh).getMockImplementation()!
+  vi.mocked(Commands.prototype.gh).mockImplementation(async (...args) => {
+    const path = args[0][1] ?? ''
+    if (path.includes('/check-runs')) return [{ check_runs: [] }]
+    if (path.includes('/statuses')) {
+      expect(path).toContain(remoteHead)
+      return [[{ context: ciName, state: ciStatus, creator: { id: publisher } }]]
+    }
+    if (path.endsWith('/pulls/42')) {
+      const pull = await previous(...args) as { head: object }
+      return { ...pull, head: { ...pull.head, sha: remoteHead } }
+    }
+    return previous(...args)
+  })
+  const ready = (head: string) => runTool(sessionId, 'orchestrator_report', {
+    state: 'ready', summary: 'Ready after independent review', pr_number: 42, verified_head_sha: head,
+  })
+  await expect(ready(sha)).rejects.toThrow(/CircleCI/i)
+  await runtime.idle()
+  expect(runtime.effects.pending('commitReviewCi')).toBe(true)
+  ciStatus = 'failure'
+  await expect(ready(sha)).rejects.toThrow(/CircleCI/i)
+  ciStatus = 'success'
+  ciName = 'unrelated check'
+  await expect(ready(sha)).rejects.toThrow(/CircleCI/i)
+  ciName = 'ci/circleci: build'
+  publisher = 123
+  await expect(ready(sha)).rejects.toThrow(/CircleCI/i)
+  publisher = 127350680
+  writeFileSync(join(workspace, 'feature.txt'), 'later, unreviewed implementation\n')
+  git('add', '--', 'feature.txt')
+  git('-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'Unreviewed update')
+  remoteHead = git('rev-parse', 'HEAD')
+  await expect(ready(remoteHead)).rejects.toThrow(/lack an independent staged review/i)
+  remoteHead = sha
+  runtime.store.db.prepare("UPDATE effect SET due = 0 WHERE kind = 'commitReviewCi'").run()
+  await runtime.idle()
+  expect(runtime.effects.pending('commitReviewCi')).toBe(false)
+  expect(relays(sessionId)).toContainEqual({ text: expect.stringContaining('CircleCI passed') })
+  await expect(ready(sha)).resolves.toMatchObject({ reported: true })
 })

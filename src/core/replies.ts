@@ -1,7 +1,7 @@
 /** The Engine's messages to Channels, each by the rule that allows it. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, liveTicket, ticketOutcome } from './model.ts'
+import { latestAssignment, liveTicket, threadKey, ticketOutcome } from './model.ts'
 import type { ChannelRef, Ticket, Trigger } from './model.ts'
 import type { ReplyStatus } from './ports.ts'
 import { EnginePart } from './part.ts'
@@ -43,6 +43,44 @@ export class Replies extends EnginePart {
   acknowledgeAccepted(ticketId: string, trigger: Trigger, text: string): void {
     if (trigger.channel && trigger.human) this.options.outbox.send({ id: key('ack', trigger.id), channel: trigger.channel, text, kind: 'acknowledgement', ticketId })
   }
+  /** Confirm receipt of an explicit follow-up on the ticket's own PR before the worker starts. */
+  acknowledgePullFollowup(ticketId: string, trigger: Trigger): void {
+    const ticket = this.require(ticketId)
+    if (!liveTicket(ticket)) return
+    const channel = this.pullFollowupChannel(ticket, trigger)
+    if (!channel) return
+    const id = key('ack', trigger.id)
+    if (this.options.outbox.status(id)) return
+    this.options.outbox.send({ id, channel, text: 'I received your request and queued it for the PR worker.',
+      kind: 'acknowledgement', ticketId })
+    // Keep delivery receipt separate from the worker deciding to take up the request.
+    const disposition = this.repo.triggers.disposition(trigger.id)!
+    this.repo.triggers.saveDisposition(trigger.id, { ...disposition, acked: disposition.acked ?? [] })
+  }
+
+  /** Send one public status notice for a failed request without exposing the worker's internal report. */
+  notifyPullFollowupFailure(ticket: Ticket, newestFirst: readonly string[]): void {
+    for (const triggerId of newestFirst) {
+      const trigger = this.repo.triggers.get(triggerId)
+      if (!trigger || !this.owners(trigger).includes(ticket.id)) continue
+      const channel = this.pullFollowupChannel(ticket, trigger)
+      if (!channel) continue
+      this.options.outbox.send({ id: key('pr-followup-failure', triggerId), channel, ticketId: ticket.id,
+        kind: 'notice', text: 'Review work on your request stopped before completion. The Superagent ticket has the failure details.' })
+      return
+    }
+  }
+
+  private pullFollowupChannel(ticket: Ticket, trigger: Trigger): ChannelRef | undefined {
+    if (!trigger.human || trigger.source !== 'github' || !trigger.addressed || trigger.meta.isPr !== true
+      || trigger.meta.kind !== 'conversation' || trigger.channel?.source !== 'github') return undefined
+    const ref = trigger.threads.find(ref => threadKey(ref) === trigger.channel!.thread)
+    if (!ref || !ticket.follows?.some(follow => follow.thread === threadKey(ref) && follow.own && !follow.closed)) return undefined
+    const thread = this.thread(ref)
+    const gate = this.policy().gate(trigger, thread, this.ticketsOnThread(thread))
+    return gate.admissible && gate.strength === 'explicit' ? trigger.channel : undefined
+  }
+
   /** Withdraw a ticket's question for a person from the outbox, unless it went out already. */
   withdrawAttention(attentionId: string): void { this.options.outbox.withdraw(key('attention-reply', attentionId)) }
   private acknowledge(request: Extract<ReplyRequest, { purpose: 'acknowledgement' }>): Reply {
