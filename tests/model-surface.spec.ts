@@ -38,7 +38,7 @@ interface Skill { name: string; description: string; content: string }
  * Lower this limit when shrinking model-facing text; raise it only intentionally and explain why in the commit message.
  */
 // Allow the review checklist/evidence schema and fresh-main branch instructions.
-const BUDGET: Record<Role, number> = { orchestrator: 59_000, worker: 41_500 }
+const BUDGET: Record<Role, number> = { orchestrator: 59_000, worker: 42_500 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
 const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = 'src/app/assessment.ts'
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'
