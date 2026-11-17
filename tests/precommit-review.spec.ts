@@ -147,7 +147,7 @@ it('requires a separate approval for a two-parent integration commit', async () 
     await git('config', 'user.email', 'worker@example.com')
     await git('commit', '--allow-empty', '-m', 'base')
     await git('branch', 'existing-pr')
-    await writeFile(join(repo, 'upstream.txt'), 'current upstream\n')
+    await writeFile(join(repo, 'upstream.txt'), 'current upstream\n'.repeat(15000))
     await git('add', 'upstream.txt')
     await git('commit', '-m', 'Advance main')
     await git('push', 'origin', 'main')
@@ -158,7 +158,8 @@ it('requires a separate approval for a two-parent integration commit', async () 
     const signal = new AbortController().signal
     await expect(git('commit', '-m', 'Unreviewed merge')).rejects.toThrow('orchestrator_review_staged')
     const approved = await reviewStaged(repo, async snapshot => {
-      expect(snapshot.patch).toContain('+current upstream')
+      expect(snapshot.automaticMergeTree).toBe(snapshot.tree)
+      expect(snapshot.patch).toBe('')
       return { decision: 'approved', summary: 'Reviewed integration tree' }
     }, signal)
     expect(approved.decision).toBe('approved')

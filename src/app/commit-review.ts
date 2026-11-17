@@ -19,6 +19,7 @@ const Verdict = z.object({
 const INSTRUCTIONS = [
   'You are an independent, read-only code reviewer. The implementation worker is a separate agent.',
   'Review the complete unified Git diff against the ticket scope and recent human follow-ups. Hunk boundaries omit unchanged lines.',
+  'When automaticMergeTree is present, the diff shows the edits to the clean merge of the two listed parents. Review those edits and any integration problems visible in the staged tree.',
   'Identify concrete defects or regressions. Use the follow-ups to understand intended behavior.',
   'fileContext contains bounded staged file content with omitted sections marked. patch is the full staged diff. Evaluate the resulting tree using added and unchanged lines.',
   'Use unchanged staged lines as evidence of behavior already present. A staged follow-up such as a lint fix may be incremental. Review the effects of the staged diff and distinguish existing incompleteness from a defect introduced or left by the proposed change.',
@@ -75,7 +76,7 @@ export async function reviewWithModel(ctx: Context, settings: Settings, ticket: 
         tools: [VERDICT_TOOL],
         messages: [{ role: 'user', content: [{ type: 'text', text: JSON.stringify({
           title: ticket.title, scope: ticket.mandate.scope, request, followUps, parent: snapshot.parent, mergeParent: snapshot.mergeParent,
-          tree: snapshot.tree, patch: snapshot.patch, fileContext: snapshot.fileContext,
+          tree: snapshot.tree, automaticMergeTree: snapshot.automaticMergeTree, patch: snapshot.patch, fileContext: snapshot.fileContext,
         }) }] }],
         signal: routeSignal,
       })) {

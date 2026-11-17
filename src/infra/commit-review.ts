@@ -74,7 +74,7 @@ export interface ReviewVerdict {
   decision: 'approved' | 'changes_requested'
   summary: string
 }
-export type ReviewSnapshot = { parent: string; mergeParent?: string; tree: string; patch: string; headPatch?: string; fileContext: Record<string, string> }
+export type ReviewSnapshot = { parent: string; mergeParent?: string; automaticMergeTree?: string; tree: string; patch: string; headPatch?: string; fileContext: Record<string, string> }
 
 function receipt(parent: string, tree: string, mergeParent?: string): string {
   if ((parent !== 'root' && !objectId.test(parent)) || !objectId.test(tree)) {
@@ -104,7 +104,12 @@ export async function reviewStaged(
   if (expected && (before.parent !== expected.parent || before.mergeParent !== expected.mergeParent || before.tree !== expected.tree)) {
     return { decision: 'stale', summary: 'The commit differs from the staged index. Stage the intended changes, then retry git commit.' }
   }
-  const base = before.parent === 'root'
+  // A successful three-way merge reconstructs inherited content from both immutable parents.
+  // Conflicts retain the full first-parent review so every resolution remains visible.
+  const automaticMergeTree = before.mergeParent
+    ? await gitOptional(directory, ['merge-tree', '--write-tree', before.parent, before.mergeParent], signal)
+    : ''
+  const base = objectId.test(automaticMergeTree) ? automaticMergeTree : before.parent === 'root'
     ? await git(directory, ['hash-object', '-w', '-t', 'tree', '/dev/null'], signal) : before.parent
   const diff = ['diff', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=none']
   await git(directory, [...diff, '--check', base, before.tree, '--'], signal)
@@ -131,7 +136,7 @@ export async function reviewStaged(
   const headPatch = before.parent === 'root' ? '' : await gitOptional(directory,
     ['show', '--format=', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=3', before.parent, '--'], signal)
   const verdict = await reviewer({ parent: before.parent, ...before.mergeParent ? { mergeParent: before.mergeParent } : {},
-    tree: before.tree, patch, ...headPatch ? { headPatch: headPatch.slice(0, 24_000) } : {}, fileContext }, signal)
+    ...automaticMergeTree ? { automaticMergeTree } : {}, tree: before.tree, patch, ...headPatch ? { headPatch: headPatch.slice(0, 24_000) } : {}, fileContext }, signal)
   signal.throwIfAborted()
   const after = await stagedIdentity(directory, signal)
   if (before.tree !== after.tree || before.parent !== after.parent || before.mergeParent !== after.mergeParent) {
